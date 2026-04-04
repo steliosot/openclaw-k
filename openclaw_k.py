@@ -27,6 +27,7 @@ DEFAULT_API_PORT = 8787
 DEFAULT_WAIT_TIMEOUT_SECONDS = 240
 DEFAULT_PUBLISH_BIND_IP = os.getenv("OPENCLAW_K_PUBLISH_BIND_IP", "0.0.0.0")
 DEFAULT_CONNECT_HOST = os.getenv("OPENCLAW_K_CONNECT_HOST", "127.0.0.1")
+DEFAULT_CONFIG_FILE_ENV = "OPENCLAW_K_DEFAULT_CONFIG_FILE"
 
 
 class ServiceError(Exception):
@@ -132,6 +133,17 @@ def resolve_config_file_path(config_file_arg: str | None) -> Path | None:
         if not config_path.is_file():
             raise ServiceError(400, "invalid_config_file", f"Config file not found: {config_path}")
         return config_path
+
+    env_default = os.getenv(DEFAULT_CONFIG_FILE_ENV)
+    if env_default:
+        env_path = Path(env_default).expanduser().resolve()
+        if not env_path.is_file():
+            raise ServiceError(
+                400,
+                "invalid_config_file",
+                f"{DEFAULT_CONFIG_FILE_ENV} is set but file not found: {env_path}",
+            )
+        return env_path
 
     default_path = (Path.cwd() / "openclaw.json").resolve()
     if default_path.is_file():

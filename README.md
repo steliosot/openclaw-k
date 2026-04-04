@@ -61,6 +61,7 @@ When creating a user, `openclaw-k` prints:
 `openclaw-k create user` config behavior:
 
 - If `--config-file` is provided, that file is ingested as `/home/node/.openclaw/openclaw.json`.
+- If `OPENCLAW_K_DEFAULT_CONFIG_FILE` is set, that file is ingested automatically.
 - If `--config-file` is omitted and `./openclaw.json` exists, it is ingested automatically.
 - If neither is available, creation continues with default OpenClaw config.
 
@@ -86,6 +87,27 @@ GCP VM style (accept remote API clients):
 ```bash
 export OPENCLAW_K_API_TOKEN='z3hra-1k3r-st3li0s-04-04-2026!'
 openclaw-k api serve --host 0.0.0.0 --port 8787
+```
+
+Automatic config for every created user:
+
+```bash
+export OPENCLAW_K_DEFAULT_CONFIG_FILE='/opt/openclaw-k/openclaw.json'
+```
+
+If you run API inside Docker, mount it and set env:
+
+```bash
+docker run -d \
+  --name openclaw-k-api \
+  --restart unless-stopped \
+  -p 8787:8787 \
+  -e OPENCLAW_K_API_TOKEN='z3hra-1k3r-st3li0s-04-04-2026!' \
+  -e OPENCLAW_K_DEFAULT_CONFIG_FILE='/app/openclaw.json' \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v /opt/openclaw-k/openclaw.json:/app/openclaw.json:ro \
+  openclaw-k:local \
+  api serve --host 0.0.0.0 --port 8787
 ```
 
 Auth for all `/v1/*` endpoints:
