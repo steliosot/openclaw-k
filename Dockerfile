@@ -2,7 +2,7 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-COPY pyproject.toml README.md clawctl.py /app/
+COPY pyproject.toml README.md openclaw_k.py /app/
 RUN pip install --no-cache-dir .
 
-ENTRYPOINT ["clawctl"]
+ENTRYPOINT ["openclaw-k"]

@@ -323,8 +323,8 @@ def create_user_service(
 
     try:
         client.images.pull(image)
-        client.volumes.create(name=user.config_volume, labels={"managed-by": "clawctl", "clawctl.user": username})
-        client.volumes.create(name=user.workspace_volume, labels={"managed-by": "clawctl", "clawctl.user": username})
+        client.volumes.create(name=user.config_volume, labels={"managed-by": "openclaw-k", "openclaw-k.user": username})
+        client.volumes.create(name=user.workspace_volume, labels={"managed-by": "openclaw-k", "openclaw-k.user": username})
 
         volume_mounts = {
             user.config_volume: {"bind": "/home/node/.openclaw", "mode": "rw"},
@@ -340,7 +340,7 @@ def create_user_service(
             ports={f"{OPENCLAW_INTERNAL_PORT}/tcp": ("127.0.0.1", port)},
             environment={"OPENCLAW_GATEWAY_TOKEN": token},
             command=["node", "openclaw.mjs", "gateway", "--allow-unconfigured", "--bind", "lan"],
-            labels={"app": "openclaw", "managed-by": "clawctl", "clawctl.user": username},
+            labels={"app": "openclaw", "managed-by": "openclaw-k", "openclaw-k.user": username},
             volumes=volume_mounts,
         )
 
@@ -398,12 +398,12 @@ def inspect_user_service(*, username: str) -> dict[str, Any]:
 
 def list_users_service() -> list[dict[str, Any]]:
     client = get_docker_client()
-    containers = client.containers.list(all=True, filters={"label": "managed-by=clawctl"})
+    containers = client.containers.list(all=True, filters={"label": "managed-by=openclaw-k"})
 
     items: list[dict[str, Any]] = []
     for container in containers:
         container.reload()
-        user = container.labels.get("clawctl.user", "unknown")
+        user = container.labels.get("openclaw-k.user", "unknown")
         host_port = extract_host_port(container)
         health = container.attrs.get("State", {}).get("Health", {}).get("Status", "n/a")
         ready = is_gateway_live(container) and has_model_synced(container)
@@ -495,7 +495,7 @@ def inspect_user_cli(args: argparse.Namespace) -> None:
 def list_users_cli(_: argparse.Namespace) -> None:
     items = list_users_service()
     if not items:
-        print("No clawctl-managed OpenClaw users found.")
+        print("No openclaw-k-managed OpenClaw users found.")
         return
 
     print("USER\tCONTAINER\tSTATUS\tHEALTH\tREADY\tPORT")
@@ -535,7 +535,7 @@ def build_auth_dependency(admin_token: str):
 
 
 def create_api_app(admin_token: str) -> FastAPI:
-    app = FastAPI(title="clawctl API", version="1.0.0")
+    app = FastAPI(title="openclaw-k API", version="1.0.0")
     require_bearer = build_auth_dependency(admin_token)
 
     @app.exception_handler(HTTPException)
@@ -562,7 +562,7 @@ def create_api_app(admin_token: str) -> FastAPI:
 
     @app.get("/health")
     def health() -> dict[str, Any]:
-        return {"ok": True, "service": "clawctl-api"}
+        return {"ok": True, "service": "openclaw-k-api"}
 
     @app.post("/v1/users", response_model=CreateUserResponse, status_code=201, dependencies=[Depends(require_bearer)])
     def create_user_endpoint(request: CreateUserRequest) -> dict[str, Any]:
@@ -591,9 +591,9 @@ def create_api_app(admin_token: str) -> FastAPI:
 
 
 def api_serve_cli(args: argparse.Namespace) -> None:
-    token = args.token or os.getenv("CLAWCTL_API_TOKEN")
+    token = args.token or os.getenv("OPENCLAW_K_API_TOKEN")
     if not token:
-        raise ServiceError(400, "token_required", "Provide --token or set CLAWCTL_API_TOKEN.")
+        raise ServiceError(400, "token_required", "Provide --token or set OPENCLAW_K_API_TOKEN.")
 
     app = create_api_app(token)
     import uvicorn
@@ -603,7 +603,7 @@ def api_serve_cli(args: argparse.Namespace) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="clawctl",
+        prog="openclaw-k",
         description="Manage per-user OpenClaw Docker containers.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -650,15 +650,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     list_parser = subparsers.add_parser("list", help="List resources")
     list_sub = list_parser.add_subparsers(dest="resource", required=True)
-    list_user_parser = list_sub.add_parser("users", help="List clawctl-managed OpenClaw users")
+    list_user_parser = list_sub.add_parser("users", help="List openclaw-k-managed OpenClaw users")
     list_user_parser.set_defaults(func=list_users_cli)
 
     api_parser = subparsers.add_parser("api", help="Run HTTP API server")
     api_sub = api_parser.add_subparsers(dest="resource", required=True)
-    api_serve_parser = api_sub.add_parser("serve", help="Serve clawctl HTTP API")
+    api_serve_parser = api_sub.add_parser("serve", help="Serve openclaw-k HTTP API")
     api_serve_parser.add_argument("--host", default=DEFAULT_API_HOST, help=f"Listen host (default: {DEFAULT_API_HOST})")
     api_serve_parser.add_argument("--port", type=int, default=DEFAULT_API_PORT, help=f"Listen port (default: {DEFAULT_API_PORT})")
-    api_serve_parser.add_argument("--token", help="Admin API Bearer token (fallback: CLAWCTL_API_TOKEN env)")
+    api_serve_parser.add_argument(
+        "--token",
+        help="Admin API Bearer token (fallback: OPENCLAW_K_API_TOKEN env)",
+    )
     api_serve_parser.set_defaults(func=api_serve_cli)
 
     return parser

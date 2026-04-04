@@ -7,7 +7,7 @@ HEADERS = {"Authorization": f"Bearer {TOKEN}"}
 payload = {
     "username": "demo1",
     "port": 19111,
-    # "config_file_path": "/Users/stelios/Desktop/clawctl-n/openclaw.json",  # optional
+    # "config_file_path": "/Users/stelios/Desktop/openclaw-k/openclaw.json",  # optional
     "wait_timeout_seconds": 300
 }
 

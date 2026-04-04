@@ -3,13 +3,13 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-import clawctl
+import openclaw_k
 
 
 class ClawctlApiTests(unittest.TestCase):
     def setUp(self) -> None:
         self.token = "test-token"
-        self.client = TestClient(clawctl.create_api_app(self.token))
+        self.client = TestClient(openclaw_k.create_api_app(self.token))
         self.auth = {"Authorization": f"Bearer {self.token}"}
 
     def test_health_is_public(self) -> None:
@@ -27,7 +27,7 @@ class ClawctlApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 403)
         self.assertEqual(response.json()["error"]["code"], "auth_forbidden")
 
-    @patch("clawctl.list_users_service")
+    @patch("openclaw_k.list_users_service")
     def test_list_users_success(self, mock_list_users_service) -> None:
         mock_list_users_service.return_value = [
             {
@@ -45,7 +45,7 @@ class ClawctlApiTests(unittest.TestCase):
         self.assertEqual(len(data["items"]), 1)
         self.assertEqual(data["items"][0]["user"], "alice")
 
-    @patch("clawctl.create_user_service")
+    @patch("openclaw_k.create_user_service")
     def test_create_user_success(self, mock_create_user_service) -> None:
         mock_create_user_service.return_value = {
             "user": "alice",
@@ -55,7 +55,7 @@ class ClawctlApiTests(unittest.TestCase):
             "url": "http://127.0.0.1:19001/",
             "connect_link": "http://127.0.0.1:19001/#token=abc",
             "token": "abc",
-            "image": clawctl.DEFAULT_OPENCLAW_IMAGE,
+            "image": openclaw_k.DEFAULT_OPENCLAW_IMAGE,
             "config_ingested": True,
             "config_file_path": "/tmp/openclaw.json",
         }
@@ -76,9 +76,9 @@ class ClawctlApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.json()["error"]["code"], "invalid_request")
 
-    @patch("clawctl.create_user_service")
+    @patch("openclaw_k.create_user_service")
     def test_create_user_conflict(self, mock_create_user_service) -> None:
-        mock_create_user_service.side_effect = clawctl.ServiceError(409, "user_exists", "already exists")
+        mock_create_user_service.side_effect = openclaw_k.ServiceError(409, "user_exists", "already exists")
         response = self.client.post(
             "/v1/users",
             headers=self.auth,

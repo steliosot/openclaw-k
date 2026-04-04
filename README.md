@@ -1,4 +1,4 @@
-# clawctl
+# openclaw-k
 
 Minimal Python CLI to manage per-user OpenClaw Docker containers.
 
@@ -14,13 +14,13 @@ Requirements:
 Install and run:
 
 ```bash
-cd /Users/stelios/Desktop/clawctl-n
+cd /Users/stelios/Desktop/openclaw-k
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e .
 
 # Create one OpenClaw instance for user alice on port 19001
-clawctl create user alice --port 19001
+openclaw-k create user alice --port 19001
 ```
 
 Open the printed convenience link in your browser (`http://127.0.0.1:<port>/#token=...`).
@@ -29,36 +29,36 @@ Open the printed convenience link in your browser (`http://127.0.0.1:<port>/#tok
 
 ```bash
 # Create an OpenClaw user/container on port 19001
-clawctl create user alice --port 19001
+openclaw-k create user alice --port 19001
 
 # Create using explicit config file and wait up to 5 minutes for readiness
-clawctl create user alice --port 19001 --config-file ./openclaw.json --wait-timeout 300
+openclaw-k create user alice --port 19001 --config-file ./openclaw.json --wait-timeout 300
 
 # Inspect one user
-clawctl inspect user alice
+openclaw-k inspect user alice
 
 # List managed users
-clawctl list users
+openclaw-k list users
 
 # Delete user container + volumes
-clawctl delete user alice
+openclaw-k delete user alice
 
 # Delete container only (keep data volumes)
-clawctl delete user alice --keep-data
+openclaw-k delete user alice --keep-data
 
 # Run API server (docs at /docs)
-export CLAWCTL_API_TOKEN='change-me'
-clawctl api serve --host 127.0.0.1 --port 8787
+export OPENCLAW_K_API_TOKEN='change-me'
+openclaw-k api serve --host 127.0.0.1 --port 8787
 ```
 
-When creating a user, `clawctl` prints:
+When creating a user, `openclaw-k` prints:
 
 - base URL
 - generated token
 - convenience URL with `#token=...`
 - readiness success only after gateway is live and model initialization is detected
 
-`clawctl create user` config behavior:
+`openclaw-k create user` config behavior:
 
 - If `--config-file` is provided, that file is ingested as `/home/node/.openclaw/openclaw.json`.
 - If `--config-file` is omitted and `./openclaw.json` exists, it is ingested automatically.
@@ -66,32 +66,32 @@ When creating a user, `clawctl` prints:
 
 ## Architecture
 
-- There is no always-on `clawctl` API server in this project.
-- `clawctl` is a command-line tool that talks directly to Docker, then exits.
+- There is no always-on `openclaw-k` API server in this project.
+- `openclaw-k` is a command-line tool that talks directly to Docker, then exits.
 - Each `create user` command creates one OpenClaw container (`openclaw-<user>`).
 - If you create only one user, seeing only one container is expected.
-- Running `clawctl` as a container is also not a persistent server; it is a short-lived helper container that controls Docker via `/var/run/docker.sock`.
+- Running `openclaw-k` as a container is also not a persistent server; it is a short-lived helper container that controls Docker via `/var/run/docker.sock`.
 
 ## HTTP API (Bearer Token)
 
 Start API:
 
 ```bash
-export CLAWCTL_API_TOKEN='change-me'
-clawctl api serve --host 127.0.0.1 --port 8787
+export OPENCLAW_K_API_TOKEN='change-me'
+openclaw-k api serve --host 127.0.0.1 --port 8787
 ```
 
 GCP VM style (accept remote API clients):
 
 ```bash
-export CLAWCTL_API_TOKEN='z3hra-1k3r-st3li0s-04-04-2026!'
-clawctl api serve --host 0.0.0.0 --port 8787
+export OPENCLAW_K_API_TOKEN='z3hra-1k3r-st3li0s-04-04-2026!'
+openclaw-k api serve --host 0.0.0.0 --port 8787
 ```
 
 Auth for all `/v1/*` endpoints:
 
 ```http
-Authorization: Bearer <CLAWCTL_API_TOKEN>
+Authorization: Bearer <OPENCLAW_K_API_TOKEN>
 ```
 
 OpenAPI docs:
@@ -103,7 +103,7 @@ Endpoints:
 
 - `GET /health`
   - public liveness check
-  - returns: `{ "ok": true, "service": "clawctl-api" }`
+  - returns: `{ "ok": true, "service": "openclaw-k-api" }`
 - `POST /v1/users`
   - create user/container and wait until ready
   - request:
@@ -150,13 +150,13 @@ Standard API errors:
 
 ## End-to-End Tutorial (Server + Python Client)
 
-1. Start `clawctl` API server on VM
+1. Start `openclaw-k` API server on VM
 
 ```bash
-cd /Users/stelios/Desktop/clawctl-n
+cd /Users/stelios/Desktop/openclaw-k
 source .venv/bin/activate
-export CLAWCTL_API_TOKEN='z3hra-1k3r-st3li0s-04-04-2026!'
-clawctl api serve --host 0.0.0.0 --port 8787
+export OPENCLAW_K_API_TOKEN='z3hra-1k3r-st3li0s-04-04-2026!'
+openclaw-k api serve --host 0.0.0.0 --port 8787
 ```
 
 2. Optional health check
@@ -224,7 +224,7 @@ curl -X DELETE \
 Build:
 
 ```bash
-docker build -t clawctl:local .
+docker build -t openclaw-k:local .
 ```
 
 Run against host Docker daemon:
@@ -232,7 +232,7 @@ Run against host Docker daemon:
 ```bash
 docker run --rm \
   -v /var/run/docker.sock:/var/run/docker.sock \
-  clawctl:local create user bob --port 19002
+  openclaw-k:local create user bob --port 19002
 ```
 
 Delete:
@@ -240,5 +240,5 @@ Delete:
 ```bash
 docker run --rm \
   -v /var/run/docker.sock:/var/run/docker.sock \
-  clawctl:local delete user bob
+  openclaw-k:local delete user bob
 ```
