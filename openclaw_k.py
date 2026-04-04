@@ -15,7 +15,7 @@ from typing import Any
 
 import docker
 from docker.errors import APIError, DockerException, NotFound
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field
@@ -25,6 +25,8 @@ OPENCLAW_INTERNAL_PORT = 18789
 DEFAULT_API_HOST = "127.0.0.1"
 DEFAULT_API_PORT = 8787
 DEFAULT_WAIT_TIMEOUT_SECONDS = 240
+DEFAULT_PUBLISH_BIND_IP = os.getenv("OPENCLAW_K_PUBLISH_BIND_IP", "0.0.0.0")
+DEFAULT_CONNECT_HOST = os.getenv("OPENCLAW_K_CONNECT_HOST", "127.0.0.1")
 
 
 class ServiceError(Exception):
@@ -309,6 +311,8 @@ def create_user_service(
     image: str = DEFAULT_OPENCLAW_IMAGE,
     config_file_arg: str | None = None,
     wait_timeout_seconds: int = DEFAULT_WAIT_TIMEOUT_SECONDS,
+    connect_host: str = DEFAULT_CONNECT_HOST,
+    publish_bind_ip: str = DEFAULT_PUBLISH_BIND_IP,
 ) -> dict[str, Any]:
     user = UserContainer(username)
     token = key or secrets.token_urlsafe(24)
@@ -337,7 +341,7 @@ def create_user_service(
             name=user.container_name,
             detach=True,
             restart_policy={"Name": "unless-stopped"},
-            ports={f"{OPENCLAW_INTERNAL_PORT}/tcp": ("127.0.0.1", port)},
+            ports={f"{OPENCLAW_INTERNAL_PORT}/tcp": (publish_bind_ip, port)},
             environment={"OPENCLAW_GATEWAY_TOKEN": token},
             command=["node", "openclaw.mjs", "gateway", "--allow-unconfigured", "--bind", "lan"],
             labels={"app": "openclaw", "managed-by": "openclaw-k", "openclaw-k.user": username},
@@ -358,8 +362,8 @@ def create_user_service(
         "container": user.container_name,
         "status": "ready",
         "port": port,
-        "url": f"http://127.0.0.1:{port}/",
-        "connect_link": f"http://127.0.0.1:{port}/#token={token}",
+        "url": f"http://{connect_host}:{port}/",
+        "connect_link": f"http://{connect_host}:{port}/#token={token}",
         "token": token,
         "image": image,
         "config_ingested": config_file_path is not None,
@@ -367,7 +371,7 @@ def create_user_service(
     }
 
 
-def inspect_user_service(*, username: str) -> dict[str, Any]:
+def inspect_user_service(*, username: str, connect_host: str = DEFAULT_CONNECT_HOST) -> dict[str, Any]:
     client = get_docker_client()
     container, user = read_user_info(client, username)
 
@@ -377,8 +381,8 @@ def inspect_user_service(*, username: str) -> dict[str, Any]:
     config_exists = container.exec_run(["sh", "-lc", "test -f /home/node/.openclaw/openclaw.json"]).exit_code == 0
     ready = is_gateway_live(container) and has_model_synced(container)
 
-    url = f"http://127.0.0.1:{host_port}/" if host_port is not None else None
-    link = f"http://127.0.0.1:{host_port}/#token={token}" if host_port is not None and token else None
+    url = f"http://{connect_host}:{host_port}/" if host_port is not None else None
+    link = f"http://{connect_host}:{host_port}/#token={token}" if host_port is not None and token else None
     image = container.image.tags[0] if container.image.tags else container.image.id
 
     return {
@@ -461,11 +465,13 @@ def create_user_cli(args: argparse.Namespace) -> None:
         image=args.image,
         config_file_arg=args.config_file,
         wait_timeout_seconds=args.wait_timeout,
+        connect_host=args.connect_host or DEFAULT_CONNECT_HOST,
+        publish_bind_ip=args.publish_bind_ip or DEFAULT_PUBLISH_BIND_IP,
     )
 
     print(f"Created user '{result['user']}' -> container '{result['container']}' (ready)")
     print(f"OpenClaw image: {result['image']}")
-    print(f"Port mapping: 127.0.0.1:{result['port']} -> {OPENCLAW_INTERNAL_PORT}")
+    print(f"Port mapping: {args.publish_bind_ip or DEFAULT_PUBLISH_BIND_IP}:{result['port']} -> {OPENCLAW_INTERNAL_PORT}")
     if result["config_ingested"]:
         print(f"Config ingested: {result['config_file_path']}")
     else:
@@ -478,7 +484,7 @@ def create_user_cli(args: argparse.Namespace) -> None:
 
 
 def inspect_user_cli(args: argparse.Namespace) -> None:
-    info = inspect_user_service(username=args.username)
+    info = inspect_user_service(username=args.username, connect_host=args.connect_host or DEFAULT_CONNECT_HOST)
     print(f"User: {info['user']}")
     print(f"Container: {info['container']}")
     print(f"Image: {info['image']}")
@@ -565,7 +571,8 @@ def create_api_app(admin_token: str) -> FastAPI:
         return {"ok": True, "service": "openclaw-k-api"}
 
     @app.post("/v1/users", response_model=CreateUserResponse, status_code=201, dependencies=[Depends(require_bearer)])
-    def create_user_endpoint(request: CreateUserRequest) -> dict[str, Any]:
+    def create_user_endpoint(request: CreateUserRequest, http_request: Request) -> dict[str, Any]:
+        connect_host = os.getenv("OPENCLAW_K_CONNECT_HOST", http_request.url.hostname or DEFAULT_CONNECT_HOST)
         return create_user_service(
             username=request.username,
             port=request.port,
@@ -573,6 +580,8 @@ def create_api_app(admin_token: str) -> FastAPI:
             image=request.image,
             config_file_arg=request.config_file_path,
             wait_timeout_seconds=request.wait_timeout_seconds,
+            connect_host=connect_host,
+            publish_bind_ip=DEFAULT_PUBLISH_BIND_IP,
         )
 
     @app.get("/v1/users", response_model=ListUsersResponse, dependencies=[Depends(require_bearer)])
@@ -580,8 +589,9 @@ def create_api_app(admin_token: str) -> FastAPI:
         return {"items": list_users_service()}
 
     @app.get("/v1/users/{username}", response_model=UserInspectResponse, dependencies=[Depends(require_bearer)])
-    def inspect_user_endpoint(username: str) -> dict[str, Any]:
-        return inspect_user_service(username=username)
+    def inspect_user_endpoint(username: str, http_request: Request) -> dict[str, Any]:
+        connect_host = os.getenv("OPENCLAW_K_CONNECT_HOST", http_request.url.hostname or DEFAULT_CONNECT_HOST)
+        return inspect_user_service(username=username, connect_host=connect_host)
 
     @app.delete("/v1/users/{username}", response_model=DeleteUserResponse, dependencies=[Depends(require_bearer)])
     def delete_user_endpoint(username: str, keep_data: bool = False) -> dict[str, Any]:
@@ -629,6 +639,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_OPENCLAW_IMAGE,
         help=f"OpenClaw image to run (default: {DEFAULT_OPENCLAW_IMAGE})",
     )
+    create_user_parser.add_argument(
+        "--connect-host",
+        help=f"Host used in printed URLs (default: {DEFAULT_CONNECT_HOST})",
+    )
+    create_user_parser.add_argument(
+        "--publish-bind-ip",
+        help=f"Bind IP for published OpenClaw ports (default: {DEFAULT_PUBLISH_BIND_IP})",
+    )
     create_user_parser.set_defaults(func=create_user_cli)
 
     delete_parser = subparsers.add_parser("delete", help="Delete resources")
@@ -646,6 +664,10 @@ def build_parser() -> argparse.ArgumentParser:
     inspect_sub = inspect_parser.add_subparsers(dest="resource", required=True)
     inspect_user_parser = inspect_sub.add_parser("user", help="Inspect an OpenClaw user container")
     inspect_user_parser.add_argument("username", help="User identifier")
+    inspect_user_parser.add_argument(
+        "--connect-host",
+        help=f"Host used in returned URL/link fields (default: {DEFAULT_CONNECT_HOST})",
+    )
     inspect_user_parser.set_defaults(func=inspect_user_cli)
 
     list_parser = subparsers.add_parser("list", help="List resources")
