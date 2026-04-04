@@ -8,10 +8,7 @@
   "models": {
     "providers": {
       "ollama": {
-        "baseUrl": "http://35.226.45.148:8080",
-        "headers": {
-          "Authorization": "Bearer REPLACE_ME_API_TOKEN"
-        },
+        "baseUrl": "http://10.128.0.4:11434",
         "models": [
           {
             "id": "gemma4:e2b",
