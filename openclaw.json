@@ -10,7 +10,7 @@
       "ollama": {
         "baseUrl": "http://35.226.45.148:8080",
         "headers": {
-          "Authorization": "Bearer z3hra-1k3r-st3li0s-04-04-2026!"
+          "Authorization": "Bearer REPLACE_ME_API_TOKEN"
         },
         "models": [
           {

@@ -85,7 +85,7 @@ openclaw-k api serve --host 127.0.0.1 --port 8787
 GCP VM style (accept remote API clients):
 
 ```bash
-export OPENCLAW_K_API_TOKEN='z3hra-1k3r-st3li0s-04-04-2026!'
+export OPENCLAW_K_API_TOKEN='REPLACE_ME_API_TOKEN'
 openclaw-k api serve --host 0.0.0.0 --port 8787
 ```
 
@@ -102,7 +102,7 @@ docker run -d \
   --name openclaw-k-api \
   --restart unless-stopped \
   -p 8787:8787 \
-  -e OPENCLAW_K_API_TOKEN='z3hra-1k3r-st3li0s-04-04-2026!' \
+  -e OPENCLAW_K_API_TOKEN='REPLACE_ME_API_TOKEN' \
   -e OPENCLAW_K_DEFAULT_CONFIG_FILE='/app/openclaw.json' \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v /opt/openclaw-k/openclaw.json:/app/openclaw.json:ro \
@@ -177,7 +177,7 @@ Standard API errors:
 ```bash
 cd /Users/stelios/Desktop/openclaw-k
 source .venv/bin/activate
-export OPENCLAW_K_API_TOKEN='z3hra-1k3r-st3li0s-04-04-2026!'
+export OPENCLAW_K_API_TOKEN='REPLACE_ME_API_TOKEN'
 openclaw-k api serve --host 0.0.0.0 --port 8787
 ```
 
@@ -193,7 +193,7 @@ curl http://127.0.0.1:8787/health
 import requests
 
 BASE = "http://127.0.0.1:8787"  # replace with http://<VM_PUBLIC_IP>:8787 if remote
-TOKEN = "z3hra-1k3r-st3li0s-04-04-2026!"
+TOKEN = "REPLACE_ME_API_TOKEN"
 HEADERS = {"Authorization": f"Bearer {TOKEN}"}
 
 payload = {
@@ -222,16 +222,16 @@ if response.status_code == 201:
 
 ```bash
 # List users
-curl -H "Authorization: Bearer z3hra-1k3r-st3li0s-04-04-2026!" \
+curl -H "Authorization: Bearer REPLACE_ME_API_TOKEN" \
   http://127.0.0.1:8787/v1/users
 
 # Inspect one user
-curl -H "Authorization: Bearer z3hra-1k3r-st3li0s-04-04-2026!" \
+curl -H "Authorization: Bearer REPLACE_ME_API_TOKEN" \
   http://127.0.0.1:8787/v1/users/demo1
 
 # Delete user
 curl -X DELETE \
-  -H "Authorization: Bearer z3hra-1k3r-st3li0s-04-04-2026!" \
+  -H "Authorization: Bearer REPLACE_ME_API_TOKEN" \
   "http://127.0.0.1:8787/v1/users/demo1?keep_data=false"
 ```
 
