@@ -4,6 +4,17 @@
 
 OpenClaw image used: `ghcr.io/openclaw/openclaw:latest`
 
+## Capabilities
+
+- Provider injection at user creation:
+  - default provider from `openclaw-k.yaml` (`providers.default`)
+  - optional per-user override: `--provider openclaw-openai|openclaw-gemma4|<profile>`
+- Skills injection at user creation:
+  - recursive copy from `defaults.skills_dir` into `/app/skills`
+  - nested folders/scripts are supported
+- SOUL injection at user creation:
+  - optional copy from `defaults.soul_file` into `/home/node/.openclaw/workspace/SOUL.md`
+
 ## Install
 
 Requirements:
