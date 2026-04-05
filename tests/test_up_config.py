@@ -96,12 +96,18 @@ providers:
 """.strip()
             )
             cwd = Path.cwd()
+            old_profiles_env = os.environ.get(openclaw_k.PROVIDER_PROFILES_ENV)
             os.chdir(td_path)
             try:
+                os.environ.pop(openclaw_k.PROVIDER_PROFILES_ENV, None)
                 resolved_openai = openclaw_k.resolve_config_file_path(None, "openclaw-openai")
                 resolved_gemma = openclaw_k.resolve_config_file_path(None, "openclaw-gemma4")
             finally:
                 os.chdir(cwd)
+                if old_profiles_env is None:
+                    os.environ.pop(openclaw_k.PROVIDER_PROFILES_ENV, None)
+                else:
+                    os.environ[openclaw_k.PROVIDER_PROFILES_ENV] = old_profiles_env
 
             self.assertEqual(resolved_openai, provider_openai.resolve())
             self.assertEqual(resolved_gemma, provider_gemma.resolve())
@@ -152,6 +158,7 @@ defaults:
             kwargs = mock_client.containers.run.call_args.kwargs
             self.assertEqual(kwargs["name"], "openclaw-k-api")
             self.assertIn("OPENCLAW_K_DEFAULT_PROVIDER_FILE", kwargs["environment"])
+            self.assertIn("OPENCLAW_K_PROVIDER_PROFILES_JSON", kwargs["environment"])
             mock_wait_for_api_health.assert_called_once()
 
     @patch("uvicorn.run")

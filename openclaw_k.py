@@ -67,6 +67,7 @@ INTERNAL_DEFAULTS_DIR = "/app/defaults"
 DEFAULT_API_BASE_URL = f"http://127.0.0.1:{DEFAULT_API_PORT}"
 DEFAULT_API_URL_ENV = "OPENCLAW_K_API_URL"
 OPENAI_API_KEY_ENV = "OPENAI_API_KEY"
+PROVIDER_PROFILES_ENV = "OPENCLAW_K_PROVIDER_PROFILES_JSON"
 
 
 class ServiceError(Exception):
@@ -314,6 +315,31 @@ def resolve_existing_dir(path_str: str | None, *, config_dir: Path, field_name: 
 
 
 def _resolve_provider_profile_file(provider_arg: str) -> Path:
+    profiles_json = os.getenv(PROVIDER_PROFILES_ENV)
+    needle = provider_arg.strip().lower()
+    if not needle:
+        raise ServiceError(400, "invalid_provider", "Provider cannot be empty.")
+
+    if profiles_json:
+        try:
+            mapping = json.loads(profiles_json)
+        except json.JSONDecodeError as exc:
+            raise ServiceError(500, "invalid_provider_map", f"{PROVIDER_PROFILES_ENV} is invalid JSON.") from exc
+        if isinstance(mapping, dict):
+            for profile_name, mapped_path in mapping.items():
+                if not isinstance(mapped_path, str):
+                    continue
+                p = Path(mapped_path).expanduser().resolve()
+                aliases = {
+                    str(profile_name).lower(),
+                    p.name.lower(),
+                    p.stem.lower(),
+                }
+                if needle in aliases:
+                    if not p.is_file():
+                        raise ServiceError(400, "invalid_provider", f"Provider file not found: {p}")
+                    return p
+
     up_config_path = (Path.cwd() / DEFAULT_UP_CONFIG_FILE).resolve()
     if not up_config_path.is_file():
         raise ServiceError(
@@ -322,9 +348,6 @@ def _resolve_provider_profile_file(provider_arg: str) -> Path:
             f"--provider requires {DEFAULT_UP_CONFIG_FILE} in current directory.",
         )
     up_config, loaded_config_path = load_up_config(str(up_config_path))
-    needle = provider_arg.strip().lower()
-    if not needle:
-        raise ServiceError(400, "invalid_provider", "Provider cannot be empty.")
 
     for profile_name, profile in up_config.providers.profiles.items():
         profile_path = resolve_existing_file(
@@ -980,6 +1003,17 @@ def api_serve_cli(args: argparse.Namespace) -> None:
             )
             assert provider_host_file is not None
             os.environ[DEFAULT_PROVIDER_FILE_ENV] = str(provider_host_file)
+            profile_paths: dict[str, str] = {}
+            for profile_name, profile in config.providers.profiles.items():
+                resolved = resolve_existing_file(
+                    profile.file,
+                    config_dir=config_dir,
+                    required=True,
+                    field_name=f"providers.profiles.{profile_name}.file",
+                )
+                assert resolved is not None
+                profile_paths[profile_name] = str(resolved)
+            os.environ[PROVIDER_PROFILES_ENV] = json.dumps(profile_paths)
             os.environ["OPENCLAW_K_PUBLISH_BIND_IP"] = config.defaults.publish_bind_ip
             os.environ["OPENCLAW_K_CONNECT_HOST"] = config.defaults.connect_host
 
@@ -1040,14 +1074,17 @@ def up_cli(args: argparse.Namespace) -> None:
     if not api_token:
         raise ServiceError(400, "token_required", "OPENCLAW_K_API_TOKEN is required for 'openclaw-k up'.")
 
-    default_provider = config.providers.profiles[config.providers.default]
-    provider_host_file = resolve_existing_file(
-        default_provider.file,
-        config_dir=config_dir,
-        required=True,
-        field_name=f"providers.profiles.{config.providers.default}.file",
-    )
-    assert provider_host_file is not None
+    provider_host_files: dict[str, Path] = {}
+    for profile_name, profile in config.providers.profiles.items():
+        resolved = resolve_existing_file(
+            profile.file,
+            config_dir=config_dir,
+            required=True,
+            field_name=f"providers.profiles.{profile_name}.file",
+        )
+        assert resolved is not None
+        provider_host_files[profile_name] = resolved
+    provider_host_file = provider_host_files[config.providers.default]
 
     skills_host_dir = resolve_existing_dir(config.defaults.skills_dir, config_dir=config_dir, field_name="defaults.skills_dir")
     soul_host_file = (
@@ -1074,10 +1111,14 @@ def up_cli(args: argparse.Namespace) -> None:
         raise ServiceError(500, "docker_api_error", exc.explanation or str(exc)) from exc
 
     provider_container_file = f"{INTERNAL_DEFAULTS_DIR}/provider-{config.providers.default}.json"
+    provider_container_paths: dict[str, str] = {}
     volumes: dict[str, dict[str, str]] = {
         "/var/run/docker.sock": {"bind": "/var/run/docker.sock", "mode": "rw"},
-        str(provider_host_file): {"bind": provider_container_file, "mode": "ro"},
     }
+    for profile_name, host_file in provider_host_files.items():
+        container_file = f"{INTERNAL_DEFAULTS_DIR}/provider-{profile_name}.json"
+        volumes[str(host_file)] = {"bind": container_file, "mode": "ro"}
+        provider_container_paths[profile_name] = container_file
     if skills_host_dir:
         volumes[str(skills_host_dir)] = {"bind": f"{INTERNAL_DEFAULTS_DIR}/skills", "mode": "ro"}
     if soul_host_file:
@@ -1093,6 +1134,7 @@ def up_cli(args: argparse.Namespace) -> None:
             environment={
                 "OPENCLAW_K_API_TOKEN": api_token,
                 "OPENCLAW_K_DEFAULT_PROVIDER_FILE": provider_container_file,
+                PROVIDER_PROFILES_ENV: json.dumps(provider_container_paths),
                 "OPENCLAW_K_PUBLISH_BIND_IP": config.defaults.publish_bind_ip,
                 "OPENCLAW_K_CONNECT_HOST": config.defaults.connect_host,
                 **(
