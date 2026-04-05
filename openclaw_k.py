@@ -315,10 +315,21 @@ def resolve_existing_dir(path_str: str | None, *, config_dir: Path, field_name: 
 
 
 def _resolve_provider_profile_file(provider_arg: str) -> Path:
+    def alias_variants(value: str) -> set[str]:
+        v = value.strip().lower()
+        if v.endswith(".json"):
+            v = v[:-5]
+        variants = {v}
+        for prefix in ("openclaw-", "provider-"):
+            if v.startswith(prefix):
+                variants.add(v[len(prefix) :])
+        return {x for x in variants if x}
+
     profiles_json = os.getenv(PROVIDER_PROFILES_ENV)
     needle = provider_arg.strip().lower()
     if not needle:
         raise ServiceError(400, "invalid_provider", "Provider cannot be empty.")
+    needle_aliases = alias_variants(needle)
 
     if profiles_json:
         try:
@@ -330,12 +341,8 @@ def _resolve_provider_profile_file(provider_arg: str) -> Path:
                 if not isinstance(mapped_path, str):
                     continue
                 p = Path(mapped_path).expanduser().resolve()
-                aliases = {
-                    str(profile_name).lower(),
-                    p.name.lower(),
-                    p.stem.lower(),
-                }
-                if needle in aliases:
+                aliases = alias_variants(str(profile_name)) | alias_variants(p.name) | alias_variants(p.stem)
+                if needle_aliases & aliases:
                     if not p.is_file():
                         raise ServiceError(400, "invalid_provider", f"Provider file not found: {p}")
                     return p
@@ -357,12 +364,12 @@ def _resolve_provider_profile_file(provider_arg: str) -> Path:
             field_name=f"providers.profiles.{profile_name}.file",
         )
         assert profile_path is not None
-        aliases = {
-            profile_name.lower(),
-            Path(profile.file).name.lower(),
-            Path(profile.file).stem.lower(),
-        }
-        if needle in aliases:
+        aliases = (
+            alias_variants(profile_name)
+            | alias_variants(Path(profile.file).name)
+            | alias_variants(Path(profile.file).stem)
+        )
+        if needle_aliases & aliases:
             return profile_path
 
     available = ", ".join(sorted(up_config.providers.profiles.keys()))
