@@ -169,6 +169,25 @@ class WriteFileResponse(BaseModel):
     user: str
 
 
+class ChatMessage(BaseModel):
+    role: str
+    content: Any  # string or array of content parts
+    images: list[str] | None = None  # base64 images for Ollama native format
+    model_config = ConfigDict(extra="allow")
+
+
+class ChatRequest(BaseModel):
+    model: str = "openclaw"
+    messages: list[ChatMessage]
+    stream: bool = False
+    user: str | None = None  # session identifier
+    model_config = ConfigDict(extra="allow")
+
+
+class ChatResponse(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+
 class UpdateAllRequest(BaseModel):
     users: list[str] | None = None
     provider: str | None = None
@@ -1199,6 +1218,116 @@ def create_api_app(admin_token: str) -> FastAPI:
             restart=request.restart,
             wait_timeout_seconds=request.wait_timeout_seconds,
         )
+
+    @app.post("/v1/users/{username}/chat", dependencies=[Depends(require_bearer)])
+    def chat_endpoint(username: str, request: ChatRequest) -> Any:
+        """Send a chat message to a user's container, with optional image support.
+
+        Images in messages are extracted and forwarded to Ollama's native /api/chat
+        endpoint which supports vision. Text-only messages go through openclaw's
+        /v1/chat/completions gateway.
+        """
+        import httpx
+
+        user = ManagedUser(username)
+        try:
+            container = docker.from_env().containers.get(user.container_name)
+        except NotFound:
+            raise ServiceError(404, "user_not_found", f"User '{username}' not found.")
+
+        # Get container port
+        ports = container.ports
+        port = None
+        for key, bindings in ports.items():
+            if bindings:
+                port = int(bindings[0]["HostPort"])
+                break
+        if not port:
+            raise ServiceError(500, "no_port", f"Container '{username}' has no mapped port.")
+
+        # Get token from container env
+        env_list = container.attrs.get("Config", {}).get("Env", [])
+        token = ""
+        for item in env_list:
+            if item.startswith("OPENCLAW_GATEWAY_TOKEN="):
+                token = item.split("=", 1)[1]
+                break
+
+        # Check if any message has images (inline base64 or image_url content parts)
+        has_images = False
+        ollama_messages = []
+
+        for msg in request.messages:
+            ollama_msg: dict[str, Any] = {"role": msg.role}
+
+            if isinstance(msg.content, list):
+                # OpenAI multi-content format — extract text and images
+                text_parts = []
+                image_parts = []
+                for part in msg.content:
+                    if isinstance(part, dict):
+                        if part.get("type") == "text":
+                            text_parts.append(part.get("text", ""))
+                        elif part.get("type") == "image_url":
+                            url = part.get("image_url", {}).get("url", "")
+                            if url.startswith("data:"):
+                                # Extract base64 from data URL
+                                b64 = url.split(",", 1)[1] if "," in url else ""
+                                image_parts.append(b64)
+                                has_images = True
+                ollama_msg["content"] = "\n".join(text_parts) if text_parts else ""
+                if image_parts:
+                    ollama_msg["images"] = image_parts
+            elif msg.images:
+                # Direct images array
+                ollama_msg["content"] = msg.content if isinstance(msg.content, str) else str(msg.content)
+                ollama_msg["images"] = msg.images
+                has_images = True
+            else:
+                ollama_msg["content"] = msg.content if isinstance(msg.content, str) else str(msg.content)
+
+            ollama_messages.append(ollama_msg)
+
+        if has_images:
+            # Route through Ollama native /api/chat for vision support
+            # Find Ollama URL from provider config
+            ollama_url = "http://172.17.0.1:11434"  # default docker bridge
+
+            payload = {
+                "model": request.model if request.model != "openclaw" else "gemma4:e4b",
+                "messages": ollama_messages,
+                "stream": request.stream,
+            }
+
+            try:
+                resp = httpx.post(
+                    f"{ollama_url}/api/chat",
+                    json=payload,
+                    timeout=120.0,
+                )
+                return resp.json()
+            except Exception as exc:
+                raise ServiceError(502, "ollama_error", f"Ollama request failed: {exc}")
+        else:
+            # Text-only: route through openclaw gateway's /v1/chat/completions
+            payload = {
+                "model": request.model,
+                "messages": [{"role": m.role, "content": m.content} for m in request.messages],
+                "stream": request.stream,
+            }
+            if request.user:
+                payload["user"] = request.user
+
+            try:
+                resp = httpx.post(
+                    f"http://127.0.0.1:{port}/v1/chat/completions",
+                    json=payload,
+                    headers={"Authorization": f"Bearer {token}"},
+                    timeout=120.0,
+                )
+                return resp.json()
+            except Exception as exc:
+                raise ServiceError(502, "openclaw_error", f"OpenClaw request failed: {exc}")
 
     @app.put("/v1/users/{username}/files", response_model=WriteFileResponse, dependencies=[Depends(require_bearer)])
     def write_file_endpoint(username: str, request: WriteFileRequest) -> dict[str, Any]:
