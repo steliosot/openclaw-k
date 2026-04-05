@@ -1020,6 +1020,8 @@ def api_serve_cli(args: argparse.Namespace) -> None:
                 )
                 assert resolved is not None
                 profile_paths[profile_name] = str(resolved)
+                profile_paths[Path(profile.file).stem] = str(resolved)
+                profile_paths[Path(profile.file).name] = str(resolved)
             os.environ[PROVIDER_PROFILES_ENV] = json.dumps(profile_paths)
             os.environ["OPENCLAW_K_PUBLISH_BIND_IP"] = config.defaults.publish_bind_ip
             os.environ["OPENCLAW_K_CONNECT_HOST"] = config.defaults.connect_host
@@ -1126,6 +1128,9 @@ def up_cli(args: argparse.Namespace) -> None:
         container_file = f"{INTERNAL_DEFAULTS_DIR}/provider-{profile_name}.json"
         volumes[str(host_file)] = {"bind": container_file, "mode": "ro"}
         provider_container_paths[profile_name] = container_file
+        source_profile = config.providers.profiles[profile_name]
+        provider_container_paths[Path(source_profile.file).stem] = container_file
+        provider_container_paths[Path(source_profile.file).name] = container_file
     if skills_host_dir:
         volumes[str(skills_host_dir)] = {"bind": f"{INTERNAL_DEFAULTS_DIR}/skills", "mode": "ro"}
     if soul_host_file:
