@@ -157,6 +157,37 @@ class DeleteUserResponse(BaseModel):
     keep_data: bool
 
 
+class WriteFileRequest(BaseModel):
+    path: str = Field(min_length=1, max_length=512, description="Relative path inside workspace (e.g. uploads/image.png)")
+    content: str = Field(description="Base64-encoded file content")
+    model_config = ConfigDict(extra="forbid")
+
+
+class WriteFileResponse(BaseModel):
+    status: str
+    path: str
+    user: str
+
+
+class ChatMessage(BaseModel):
+    role: str
+    content: Any  # string or array of content parts
+    images: list[str] | None = None  # base64 images for Ollama native format
+    model_config = ConfigDict(extra="allow")
+
+
+class ChatRequest(BaseModel):
+    model: str = "openclaw"
+    messages: list[ChatMessage]
+    stream: bool = False
+    user: str | None = None  # session identifier
+    model_config = ConfigDict(extra="allow")
+
+
+class ChatResponse(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+
 class UpdateAllRequest(BaseModel):
     users: list[str] | None = None
     provider: str | None = None
@@ -477,7 +508,9 @@ def put_file_into_container(container: docker.models.containers.Container, dest_
     with tarfile.open(fileobj=archive_stream, mode="w") as tar:
         info = tarfile.TarInfo(name=name)
         info.size = len(content)
-        info.mode = 0o600
+        info.mode = 0o644
+        info.uid = 1000   # node user
+        info.gid = 1000   # node group
         tar.addfile(info, io.BytesIO(content))
     archive_stream.seek(0)
     ok = container.put_archive(dest_dir, archive_stream.getvalue())
@@ -1187,6 +1220,154 @@ def create_api_app(admin_token: str) -> FastAPI:
             restart=request.restart,
             wait_timeout_seconds=request.wait_timeout_seconds,
         )
+
+    @app.post("/v1/users/{username}/chat", dependencies=[Depends(require_bearer)])
+    def chat_endpoint(username: str, request: ChatRequest) -> Any:
+        """Send a chat message to a user's container, with optional image support.
+
+        Images in messages are extracted and forwarded to Ollama's native /api/chat
+        endpoint which supports vision. Text-only messages go through openclaw's
+        /v1/chat/completions gateway.
+        """
+        import httpx
+
+        user = UserContainer(username)
+        try:
+            container = docker.from_env().containers.get(user.container_name)
+        except NotFound:
+            raise ServiceError(404, "user_not_found", f"User '{username}' not found.")
+
+        # Get container port
+        ports = container.ports
+        port = None
+        for key, bindings in ports.items():
+            if bindings:
+                port = int(bindings[0]["HostPort"])
+                break
+        if not port:
+            raise ServiceError(500, "no_port", f"Container '{username}' has no mapped port.")
+
+        # Get token from container env
+        env_list = container.attrs.get("Config", {}).get("Env", [])
+        token = ""
+        for item in env_list:
+            if item.startswith("OPENCLAW_GATEWAY_TOKEN="):
+                token = item.split("=", 1)[1]
+                break
+
+        # Check if any message has images (inline base64 or image_url content parts)
+        has_images = False
+        ollama_messages = []
+
+        for msg in request.messages:
+            ollama_msg: dict[str, Any] = {"role": msg.role}
+
+            if isinstance(msg.content, list):
+                # OpenAI multi-content format — extract text and images
+                text_parts = []
+                image_parts = []
+                for part in msg.content:
+                    if isinstance(part, dict):
+                        if part.get("type") == "text":
+                            text_parts.append(part.get("text", ""))
+                        elif part.get("type") == "image_url":
+                            url = part.get("image_url", {}).get("url", "")
+                            if url.startswith("data:"):
+                                # Extract base64 from data URL
+                                b64 = url.split(",", 1)[1] if "," in url else ""
+                                image_parts.append(b64)
+                                has_images = True
+                ollama_msg["content"] = "\n".join(text_parts) if text_parts else ""
+                if image_parts:
+                    ollama_msg["images"] = image_parts
+            elif msg.images:
+                # Direct images array
+                ollama_msg["content"] = msg.content if isinstance(msg.content, str) else str(msg.content)
+                ollama_msg["images"] = msg.images
+                has_images = True
+            else:
+                ollama_msg["content"] = msg.content if isinstance(msg.content, str) else str(msg.content)
+
+            ollama_messages.append(ollama_msg)
+
+        if has_images:
+            # Route through Ollama native /api/chat for vision support
+            ollama_url = os.getenv("OPENCLAW_K_OLLAMA_URL", "http://172.17.0.1:11434")
+            ollama_model = os.getenv("OPENCLAW_K_OLLAMA_MODEL", "gemma4:e4b")
+            ollama_headers = {}
+            ollama_auth_token = os.getenv("OPENCLAW_K_OLLAMA_AUTH_TOKEN", "")
+            if ollama_auth_token:
+                ollama_headers["Authorization"] = f"Bearer {ollama_auth_token}"
+
+            payload = {
+                "model": request.model if request.model != "openclaw" else ollama_model,
+                "messages": ollama_messages,
+                "stream": request.stream,
+            }
+
+            try:
+                resp = httpx.post(
+                    f"{ollama_url}/api/chat",
+                    json=payload,
+                    headers=ollama_headers if ollama_headers else None,
+                    timeout=120.0,
+                )
+                return resp.json()
+            except Exception as exc:
+                raise ServiceError(502, "ollama_error", f"Ollama request failed: {exc}")
+        else:
+            # Text-only: route through openclaw gateway's /v1/chat/completions
+            payload = {
+                "model": request.model,
+                "messages": [{"role": m.role, "content": m.content} for m in request.messages],
+                "stream": request.stream,
+            }
+            if request.user:
+                payload["user"] = request.user
+
+            try:
+                resp = httpx.post(
+                    f"http://127.0.0.1:{port}/v1/chat/completions",
+                    json=payload,
+                    headers={"Authorization": f"Bearer {token}"},
+                    timeout=120.0,
+                )
+                return resp.json()
+            except Exception as exc:
+                raise ServiceError(502, "openclaw_error", f"OpenClaw request failed: {exc}")
+
+    @app.put("/v1/users/{username}/files", response_model=WriteFileResponse, dependencies=[Depends(require_bearer)])
+    def write_file_endpoint(username: str, request: WriteFileRequest) -> dict[str, Any]:
+        """Write a file into a running container's workspace directory."""
+        import base64
+        import posixpath
+
+        user = UserContainer(username)
+        try:
+            container = docker.from_env().containers.get(user.container_name)
+        except NotFound:
+            raise ServiceError(404, "user_not_found", f"User '{username}' not found.")
+
+        # Decode base64 content
+        try:
+            content_bytes = base64.b64decode(request.content)
+        except Exception:
+            raise ServiceError(400, "invalid_content", "Content must be valid base64.")
+
+        # Ensure parent directories exist via the file path
+        workspace_base = "/home/node/.openclaw/workspace"
+        dest_path = posixpath.join(workspace_base, request.path)
+        dest_dir = posixpath.dirname(dest_path)
+        file_name = posixpath.basename(dest_path)
+
+        # Create parent dirs if needed
+        if dest_dir != workspace_base:
+            container.exec_run(["mkdir", "-p", dest_dir])
+
+        # Write file using Docker's put_archive (same approach as SOUL injection)
+        put_file_into_container(container, dest_dir, file_name, content_bytes)
+
+        return {"status": "ok", "path": request.path, "user": username}
 
     return app
 
