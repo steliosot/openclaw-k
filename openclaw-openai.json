@@ -1,0 +1,29 @@
+{
+    "gateway": {
+  "controlUi": {
+    "dangerouslyAllowHostHeaderOriginFallback": true,
+    "dangerouslyDisableDeviceAuth": true
+  }
+},
+  "models": {
+    "providers": {
+      "openai": {
+        "apiKey": "REPLACE_WITH_ENV_OPENAI_API_KEY",
+        "baseUrl": "https://api.openai.com/v1",
+        "models": [
+          {
+            "id": "gpt-4o-mini",
+            "name": "gpt-4o-mini"
+          }
+        ]
+      }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "openai/gpt-4o-mini"
+      }
+    }
+  }
+}

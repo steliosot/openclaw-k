@@ -1,0 +1,21 @@
+api:
+  host: 0.0.0.0
+  port: 8787
+
+docker:
+  container_name: openclaw-k-api
+  image_tag: openclaw-k:local
+
+providers:
+  default: openai
+  profiles:
+    gemma:
+      file: ./openclaw-gemma4.json
+    openai:
+      file: ./openclaw-openai.json
+
+defaults:
+  publish_bind_ip: 0.0.0.0
+  connect_host: 34.16.127.240
+  skills_dir: ./skills
+  soul_file: ./SOUL.md

@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import hmac
 import io
+import json
 import os
 import secrets
 import sys
@@ -12,13 +13,43 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+import urllib.request
+import urllib.error
+import urllib.parse
 
 import docker
 from docker.errors import APIError, DockerException, NotFound
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict, field_validator
+import yaml
+
+
+def load_dotenv_file(path: str = ".env") -> None:
+    env_path = Path(path).expanduser().resolve()
+    if not env_path.is_file():
+        return
+    for raw in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].strip()
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if not key:
+            continue
+        if (value.startswith("'") and value.endswith("'")) or (value.startswith('"') and value.endswith('"')):
+            value = value[1:-1]
+        # Existing shell env vars have priority over .env values.
+        os.environ.setdefault(key, value)
+
+
+load_dotenv_file()
 
 DEFAULT_OPENCLAW_IMAGE = "ghcr.io/openclaw/openclaw:latest"
 OPENCLAW_INTERNAL_PORT = 18789
@@ -27,7 +58,15 @@ DEFAULT_API_PORT = 8787
 DEFAULT_WAIT_TIMEOUT_SECONDS = 240
 DEFAULT_PUBLISH_BIND_IP = os.getenv("OPENCLAW_K_PUBLISH_BIND_IP", "0.0.0.0")
 DEFAULT_CONNECT_HOST = os.getenv("OPENCLAW_K_CONNECT_HOST", "127.0.0.1")
-DEFAULT_CONFIG_FILE_ENV = "OPENCLAW_K_DEFAULT_CONFIG_FILE"
+DEFAULT_PROVIDER_FILE_ENV = "OPENCLAW_K_DEFAULT_PROVIDER_FILE"
+DEFAULT_CONFIG_FILE_ENV = "OPENCLAW_K_DEFAULT_CONFIG_FILE"  # backwards-compatible alias
+DEFAULT_SKILLS_DIR_ENV = "OPENCLAW_K_DEFAULT_SKILLS_DIR"
+DEFAULT_SOUL_FILE_ENV = "OPENCLAW_K_DEFAULT_SOUL_FILE"
+DEFAULT_UP_CONFIG_FILE = "openclaw-k.yaml"
+INTERNAL_DEFAULTS_DIR = "/app/defaults"
+DEFAULT_API_BASE_URL = f"http://127.0.0.1:{DEFAULT_API_PORT}"
+DEFAULT_API_URL_ENV = "OPENCLAW_K_API_URL"
+OPENAI_API_KEY_ENV = "OPENAI_API_KEY"
 
 
 class ServiceError(Exception):
@@ -55,12 +94,17 @@ class UserContainer:
     def workspace_volume(self) -> str:
         return f"openclaw-workspace-{self.username}"
 
+    @property
+    def skills_volume(self) -> str:
+        return f"openclaw-skills-{self.username}"
+
 
 class CreateUserRequest(BaseModel):
     username: str = Field(min_length=1)
     port: int = Field(ge=1, le=65535)
     key: str | None = None
     image: str = DEFAULT_OPENCLAW_IMAGE
+    provider: str | None = None
     config_file_path: str | None = None
     wait_timeout_seconds: int = Field(default=DEFAULT_WAIT_TIMEOUT_SECONDS, ge=5, le=3600)
 
@@ -111,6 +155,107 @@ class DeleteUserResponse(BaseModel):
     keep_data: bool
 
 
+def resolve_api_base_url(api_url_arg: str | None) -> str:
+    return (api_url_arg or os.getenv(DEFAULT_API_URL_ENV) or DEFAULT_API_BASE_URL).rstrip("/")
+
+
+def resolve_api_token(api_token_arg: str | None) -> str:
+    token = api_token_arg or os.getenv("OPENCLAW_K_API_TOKEN")
+    if not token:
+        raise ServiceError(400, "token_required", "Set OPENCLAW_K_API_TOKEN or pass --api-token.")
+    return token
+
+
+def api_request(
+    *,
+    method: str,
+    path: str,
+    api_base_url: str,
+    api_token: str,
+    json_body: dict[str, Any] | None = None,
+    query_params: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    url = f"{api_base_url}{path}"
+    if query_params:
+        url = f"{url}?{urllib.parse.urlencode(query_params)}"
+
+    body: bytes | None = None
+    headers = {"Authorization": f"Bearer {api_token}"}
+    if json_body is not None:
+        body = json.dumps(json_body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+
+    req = urllib.request.Request(url=url, method=method, headers=headers, data=body)
+    try:
+        with urllib.request.urlopen(req, timeout=DEFAULT_WAIT_TIMEOUT_SECONDS + 30) as response:
+            payload = response.read().decode("utf-8")
+            return json.loads(payload) if payload else {}
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        try:
+            parsed = json.loads(raw)
+            err = parsed.get("error", {}) if isinstance(parsed, dict) else {}
+            raise ServiceError(
+                exc.code,
+                err.get("code", "http_error"),
+                err.get("message", raw or f"HTTP {exc.code}"),
+                parsed,
+            ) from exc
+        except json.JSONDecodeError:
+            raise ServiceError(exc.code, "http_error", raw or f"HTTP {exc.code}") from exc
+    except urllib.error.URLError as exc:
+        raise ServiceError(500, "api_unreachable", f"Could not reach API at {url}: {exc.reason}") from exc
+
+
+class ProviderProfile(BaseModel):
+    file: str
+
+
+class ApiConfig(BaseModel):
+    host: str = "0.0.0.0"
+    port: int = 8787
+
+
+class DockerUpConfig(BaseModel):
+    container_name: str = "openclaw-k-api"
+    image_tag: str = "openclaw-k:local"
+
+
+class ProvidersConfig(BaseModel):
+    default: str
+    profiles: dict[str, ProviderProfile]
+
+    @field_validator("profiles")
+    @classmethod
+    def validate_profiles(cls, value: dict[str, ProviderProfile]) -> dict[str, ProviderProfile]:
+        if not value:
+            raise ValueError("providers.profiles must define at least one profile.")
+        return value
+
+
+class DefaultsConfig(BaseModel):
+    publish_bind_ip: str = "0.0.0.0"
+    connect_host: str = "127.0.0.1"
+    skills_dir: str | None = None
+    soul_file: str | None = None
+
+
+class UpConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    api: ApiConfig = Field(default_factory=ApiConfig)
+    docker: DockerUpConfig = Field(default_factory=DockerUpConfig)
+    providers: ProvidersConfig
+    defaults: DefaultsConfig = Field(default_factory=DefaultsConfig)
+
+    @field_validator("providers")
+    @classmethod
+    def validate_default_provider(cls, providers: ProvidersConfig) -> ProvidersConfig:
+        if providers.default not in providers.profiles:
+            raise ValueError("providers.default must exist in providers.profiles")
+        return providers
+
+
 def error_payload(code: str, message: str, details: Any | None = None) -> dict[str, Any]:
     payload: dict[str, Any] = {"error": {"code": code, "message": message}}
     if details is not None:
@@ -127,14 +272,95 @@ def get_docker_client() -> docker.DockerClient:
         raise ServiceError(500, "docker_unreachable", f"Docker is not reachable: {exc}") from exc
 
 
-def resolve_config_file_path(config_file_arg: str | None) -> Path | None:
+def load_up_config(config_path_arg: str | None) -> tuple[UpConfig, Path]:
+    config_path = Path(config_path_arg or DEFAULT_UP_CONFIG_FILE).expanduser().resolve()
+    if not config_path.is_file():
+        raise ServiceError(400, "invalid_config", f"Config file not found: {config_path}")
+    try:
+        raw = yaml.safe_load(config_path.read_text()) or {}
+    except yaml.YAMLError as exc:
+        raise ServiceError(400, "invalid_config", f"Invalid YAML: {exc}") from exc
+    try:
+        return UpConfig.model_validate(raw), config_path
+    except Exception as exc:
+        raise ServiceError(400, "invalid_config", f"Config validation failed: {exc}") from exc
+
+
+def resolve_existing_file(path_str: str, *, config_dir: Path, required: bool, field_name: str) -> Path | None:
+    p = Path(path_str).expanduser()
+    if not p.is_absolute():
+        p = (config_dir / p).resolve()
+    else:
+        p = p.resolve()
+    if not p.is_file():
+        if required:
+            raise ServiceError(400, "invalid_config", f"{field_name} file not found: {p}")
+        return None
+    return p
+
+
+def resolve_existing_dir(path_str: str | None, *, config_dir: Path, field_name: str) -> Path | None:
+    if not path_str:
+        return None
+    p = Path(path_str).expanduser()
+    if not p.is_absolute():
+        p = (config_dir / p).resolve()
+    else:
+        p = p.resolve()
+    if not p.exists() or not p.is_dir():
+        # Optional by design; skip silently if missing.
+        return None
+    return p
+
+
+def _resolve_provider_profile_file(provider_arg: str) -> Path:
+    up_config_path = (Path.cwd() / DEFAULT_UP_CONFIG_FILE).resolve()
+    if not up_config_path.is_file():
+        raise ServiceError(
+            400,
+            "invalid_provider",
+            f"--provider requires {DEFAULT_UP_CONFIG_FILE} in current directory.",
+        )
+    up_config, loaded_config_path = load_up_config(str(up_config_path))
+    needle = provider_arg.strip().lower()
+    if not needle:
+        raise ServiceError(400, "invalid_provider", "Provider cannot be empty.")
+
+    for profile_name, profile in up_config.providers.profiles.items():
+        profile_path = resolve_existing_file(
+            profile.file,
+            config_dir=loaded_config_path.parent,
+            required=True,
+            field_name=f"providers.profiles.{profile_name}.file",
+        )
+        assert profile_path is not None
+        aliases = {
+            profile_name.lower(),
+            Path(profile.file).name.lower(),
+            Path(profile.file).stem.lower(),
+        }
+        if needle in aliases:
+            return profile_path
+
+    available = ", ".join(sorted(up_config.providers.profiles.keys()))
+    raise ServiceError(
+        400,
+        "invalid_provider",
+        f"Unknown provider '{provider_arg}'. Available profiles: {available}",
+    )
+
+
+def resolve_config_file_path(config_file_arg: str | None, provider_arg: str | None = None) -> Path | None:
     if config_file_arg:
         config_path = Path(config_file_arg).expanduser().resolve()
         if not config_path.is_file():
             raise ServiceError(400, "invalid_config_file", f"Config file not found: {config_path}")
         return config_path
 
-    env_default = os.getenv(DEFAULT_CONFIG_FILE_ENV)
+    if provider_arg:
+        return _resolve_provider_profile_file(provider_arg)
+
+    env_default = os.getenv(DEFAULT_PROVIDER_FILE_ENV) or os.getenv(DEFAULT_CONFIG_FILE_ENV)
     if env_default:
         env_path = Path(env_default).expanduser().resolve()
         if not env_path.is_file():
@@ -145,10 +371,42 @@ def resolve_config_file_path(config_file_arg: str | None) -> Path | None:
             )
         return env_path
 
+    up_config_path = (Path.cwd() / DEFAULT_UP_CONFIG_FILE).resolve()
+    if up_config_path.is_file():
+        up_config, loaded_config_path = load_up_config(str(up_config_path))
+        default_profile = up_config.providers.profiles[up_config.providers.default]
+        provider_file = resolve_existing_file(
+            default_profile.file,
+            config_dir=loaded_config_path.parent,
+            required=True,
+            field_name=f"providers.profiles.{up_config.providers.default}.file",
+        )
+        if provider_file:
+            return provider_file
+
     default_path = (Path.cwd() / "openclaw.json").resolve()
     if default_path.is_file():
         return default_path
     return None
+
+
+def resolve_optional_defaults() -> tuple[Path | None, Path | None]:
+    skills_dir_env = os.getenv(DEFAULT_SKILLS_DIR_ENV)
+    soul_file_env = os.getenv(DEFAULT_SOUL_FILE_ENV)
+
+    skills_path: Path | None = None
+    soul_path: Path | None = None
+
+    if skills_dir_env:
+        p = Path(skills_dir_env).expanduser().resolve()
+        if p.exists() and p.is_dir():
+            skills_path = p
+    if soul_file_env:
+        p = Path(soul_file_env).expanduser().resolve()
+        if p.exists() and p.is_file():
+            soul_path = p
+
+    return skills_path, soul_path
 
 
 def put_file_into_container(container: docker.models.containers.Container, dest_dir: str, name: str, content: bytes) -> None:
@@ -162,6 +420,52 @@ def put_file_into_container(container: docker.models.containers.Container, dest_
     ok = container.put_archive(dest_dir, archive_stream.getvalue())
     if not ok:
         raise ServiceError(500, "container_copy_failed", f"Could not copy '{name}' into container at '{dest_dir}'.")
+
+
+def with_openai_api_key(config_bytes: bytes) -> bytes:
+    api_key = os.getenv(OPENAI_API_KEY_ENV)
+    if not api_key:
+        return config_bytes
+    try:
+        payload = json.loads(config_bytes.decode("utf-8"))
+    except Exception:
+        return config_bytes
+    if not isinstance(payload, dict):
+        return config_bytes
+
+    models = payload.get("models")
+    if not isinstance(models, dict):
+        return config_bytes
+    providers = models.get("providers")
+    if not isinstance(providers, dict):
+        return config_bytes
+    openai = providers.get("openai")
+    if not isinstance(openai, dict):
+        return config_bytes
+
+    openai["apiKey"] = api_key
+    return json.dumps(payload, indent=2).encode("utf-8")
+
+
+def put_directory_into_container(container: docker.models.containers.Container, src_dir: Path, dest_dir: str) -> None:
+    archive_stream = io.BytesIO()
+    with tarfile.open(fileobj=archive_stream, mode="w") as tar:
+        for path in src_dir.rglob("*"):
+            rel = path.relative_to(src_dir)
+            info = tarfile.TarInfo(name=str(rel))
+            if path.is_dir():
+                info.type = tarfile.DIRTYPE
+                info.mode = 0o755
+                tar.addfile(info)
+            elif path.is_file():
+                data = path.read_bytes()
+                info.size = len(data)
+                info.mode = 0o644
+                tar.addfile(info, io.BytesIO(data))
+    archive_stream.seek(0)
+    ok = container.put_archive(dest_dir, archive_stream.getvalue())
+    if not ok:
+        raise ServiceError(500, "container_copy_failed", f"Could not copy directory '{src_dir}' into '{dest_dir}'.")
 
 
 def run_in_seed_container(
@@ -192,6 +496,8 @@ def seed_openclaw_state(
     image: str,
     volume_mounts: dict[str, dict[str, str]],
     config_file_path: Path | None,
+    skills_dir_path: Path | None,
+    soul_file_path: Path | None,
 ) -> None:
     run_in_seed_container(
         client,
@@ -199,7 +505,7 @@ def seed_openclaw_state(
         volume_mounts,
         ["sh", "-lc", "mkdir -p /home/node/.openclaw/workspace && chown -R 1000:1000 /home/node/.openclaw"],
     )
-    if not config_file_path:
+    if not config_file_path and not skills_dir_path and not soul_file_path:
         return
 
     seed = client.containers.create(
@@ -210,12 +516,22 @@ def seed_openclaw_state(
     )
     try:
         seed.start()
-        put_file_into_container(seed, "/home/node/.openclaw", "openclaw.json", config_file_path.read_bytes())
-        chown_result = seed.exec_run(
-            ["sh", "-lc", "chown 1000:1000 /home/node/.openclaw/openclaw.json && chmod 600 /home/node/.openclaw/openclaw.json"]
+        if config_file_path:
+            config_content = with_openai_api_key(config_file_path.read_bytes())
+            put_file_into_container(seed, "/home/node/.openclaw", "openclaw.json", config_content)
+        if soul_file_path:
+            put_file_into_container(seed, "/home/node/.openclaw/workspace", "SOUL.md", soul_file_path.read_bytes())
+        if skills_dir_path:
+            put_directory_into_container(seed, skills_dir_path, "/app/skills")
+
+        chown_cmd = (
+            "if [ -f /home/node/.openclaw/openclaw.json ]; then chown 1000:1000 /home/node/.openclaw/openclaw.json && chmod 600 /home/node/.openclaw/openclaw.json; fi; "
+            "if [ -f /home/node/.openclaw/workspace/SOUL.md ]; then chown 1000:1000 /home/node/.openclaw/workspace/SOUL.md && chmod 644 /home/node/.openclaw/workspace/SOUL.md; fi; "
+            "if [ -d /app/skills ]; then chown -R 1000:1000 /app/skills; fi"
         )
+        chown_result = seed.exec_run(["sh", "-lc", chown_cmd])
         if chown_result.exit_code != 0:
-            raise ServiceError(500, "config_permissions_failed", "Could not set permissions on ingested openclaw.json")
+            raise ServiceError(500, "config_permissions_failed", "Could not set permissions on seeded defaults")
     finally:
         seed.remove(force=True)
 
@@ -321,6 +637,7 @@ def create_user_service(
     port: int,
     key: str | None = None,
     image: str = DEFAULT_OPENCLAW_IMAGE,
+    provider: str | None = None,
     config_file_arg: str | None = None,
     wait_timeout_seconds: int = DEFAULT_WAIT_TIMEOUT_SECONDS,
     connect_host: str = DEFAULT_CONNECT_HOST,
@@ -328,7 +645,7 @@ def create_user_service(
 ) -> dict[str, Any]:
     user = UserContainer(username)
     token = key or secrets.token_urlsafe(24)
-    config_file_path = resolve_config_file_path(config_file_arg)
+    config_file_path = resolve_config_file_path(config_file_arg, provider)
     client = get_docker_client()
 
     try:
@@ -341,12 +658,15 @@ def create_user_service(
         client.images.pull(image)
         client.volumes.create(name=user.config_volume, labels={"managed-by": "openclaw-k", "openclaw-k.user": username})
         client.volumes.create(name=user.workspace_volume, labels={"managed-by": "openclaw-k", "openclaw-k.user": username})
+        client.volumes.create(name=user.skills_volume, labels={"managed-by": "openclaw-k", "openclaw-k.user": username})
 
         volume_mounts = {
             user.config_volume: {"bind": "/home/node/.openclaw", "mode": "rw"},
             user.workspace_volume: {"bind": "/home/node/.openclaw/workspace", "mode": "rw"},
+            user.skills_volume: {"bind": "/app/skills", "mode": "rw"},
         }
-        seed_openclaw_state(client, image, volume_mounts, config_file_path)
+        skills_dir_path, soul_file_path = resolve_optional_defaults()
+        seed_openclaw_state(client, image, volume_mounts, config_file_path, skills_dir_path, soul_file_path)
 
         container = client.containers.run(
             image,
@@ -408,7 +728,7 @@ def inspect_user_service(*, username: str, connect_host: str = DEFAULT_CONNECT_H
         "url": url,
         "connect_link": link,
         "config_file_present": config_exists,
-        "volumes": {"config": user.config_volume, "workspace": user.workspace_volume},
+        "volumes": {"config": user.config_volume, "workspace": user.workspace_volume, "skills": user.skills_volume},
     }
 
 
@@ -451,7 +771,7 @@ def delete_user_service(*, username: str, keep_data: bool = False) -> dict[str, 
 
     removed_volumes: list[str] = []
     if not keep_data:
-        for volume_name in (user.config_volume, user.workspace_volume):
+        for volume_name in (user.config_volume, user.workspace_volume, user.skills_volume):
             try:
                 volume = client.volumes.get(volume_name)
                 volume.remove(force=True)
@@ -470,22 +790,31 @@ def delete_user_service(*, username: str, keep_data: bool = False) -> dict[str, 
 
 
 def create_user_cli(args: argparse.Namespace) -> None:
-    result = create_user_service(
-        username=args.username,
-        port=args.port,
-        key=args.key,
-        image=args.image,
-        config_file_arg=args.config_file,
-        wait_timeout_seconds=args.wait_timeout,
-        connect_host=args.connect_host or DEFAULT_CONNECT_HOST,
-        publish_bind_ip=args.publish_bind_ip or DEFAULT_PUBLISH_BIND_IP,
+    api_base_url = resolve_api_base_url(args.api_url)
+    api_token = resolve_api_token(args.api_token)
+    payload = {
+        "username": args.username,
+        "port": args.port,
+        "key": args.key,
+        "image": args.image,
+        "provider": args.provider,
+        "config_file_path": args.config_file,
+        "wait_timeout_seconds": args.wait_timeout,
+    }
+    result = api_request(
+        method="POST",
+        path="/v1/users",
+        api_base_url=api_base_url,
+        api_token=api_token,
+        json_body={k: v for k, v in payload.items() if v is not None},
     )
 
     print(f"Created user '{result['user']}' -> container '{result['container']}' (ready)")
     print(f"OpenClaw image: {result['image']}")
-    print(f"Port mapping: {args.publish_bind_ip or DEFAULT_PUBLISH_BIND_IP}:{result['port']} -> {OPENCLAW_INTERNAL_PORT}")
+    print(f"Port mapping: <managed-by-api>:{result['port']} -> {OPENCLAW_INTERNAL_PORT}")
     if result["config_ingested"]:
-        print(f"Config ingested: {result['config_file_path']}")
+        config_path = result.get("config_file_path", "<default-from-api>")
+        print(f"Config ingested: {config_path}")
     else:
         print("Config ingested: none (no openclaw.json found)")
     print("\nConnection details:")
@@ -496,7 +825,14 @@ def create_user_cli(args: argparse.Namespace) -> None:
 
 
 def inspect_user_cli(args: argparse.Namespace) -> None:
-    info = inspect_user_service(username=args.username, connect_host=args.connect_host or DEFAULT_CONNECT_HOST)
+    api_base_url = resolve_api_base_url(args.api_url)
+    api_token = resolve_api_token(args.api_token)
+    info = api_request(
+        method="GET",
+        path=f"/v1/users/{args.username}",
+        api_base_url=api_base_url,
+        api_token=api_token,
+    )
     print(f"User: {info['user']}")
     print(f"Container: {info['container']}")
     print(f"Image: {info['image']}")
@@ -510,8 +846,16 @@ def inspect_user_cli(args: argparse.Namespace) -> None:
     print(f"Volumes: {info['volumes']['config']}, {info['volumes']['workspace']}")
 
 
-def list_users_cli(_: argparse.Namespace) -> None:
-    items = list_users_service()
+def list_users_cli(args: argparse.Namespace) -> None:
+    api_base_url = resolve_api_base_url(args.api_url)
+    api_token = resolve_api_token(args.api_token)
+    payload = api_request(
+        method="GET",
+        path="/v1/users",
+        api_base_url=api_base_url,
+        api_token=api_token,
+    )
+    items = payload.get("items", [])
     if not items:
         print("No openclaw-k-managed OpenClaw users found.")
         return
@@ -526,7 +870,15 @@ def list_users_cli(_: argparse.Namespace) -> None:
 
 
 def delete_user_cli(args: argparse.Namespace) -> None:
-    result = delete_user_service(username=args.username, keep_data=args.keep_data)
+    api_base_url = resolve_api_base_url(args.api_url)
+    api_token = resolve_api_token(args.api_token)
+    result = api_request(
+        method="DELETE",
+        path=f"/v1/users/{args.username}",
+        api_base_url=api_base_url,
+        api_token=api_token,
+        query_params={"keep_data": str(args.keep_data).lower()},
+    )
     print(f"Deleted container 'openclaw-{result['user']}'.")
     if args.keep_data:
         print("Kept volumes (--keep-data).")
@@ -590,6 +942,7 @@ def create_api_app(admin_token: str) -> FastAPI:
             port=request.port,
             key=request.key,
             image=request.image,
+            provider=request.provider,
             config_file_arg=request.config_file_path,
             wait_timeout_seconds=request.wait_timeout_seconds,
             connect_host=connect_host,
@@ -613,6 +966,47 @@ def create_api_app(admin_token: str) -> FastAPI:
 
 
 def api_serve_cli(args: argparse.Namespace) -> None:
+    if getattr(args, "config", None):
+        config_path = Path(args.config).expanduser().resolve()
+        if config_path.is_file():
+            config, loaded_path = load_up_config(str(config_path))
+            config_dir = loaded_path.parent
+            default_provider = config.providers.profiles[config.providers.default]
+            provider_host_file = resolve_existing_file(
+                default_provider.file,
+                config_dir=config_dir,
+                required=True,
+                field_name=f"providers.profiles.{config.providers.default}.file",
+            )
+            assert provider_host_file is not None
+            os.environ[DEFAULT_PROVIDER_FILE_ENV] = str(provider_host_file)
+            os.environ["OPENCLAW_K_PUBLISH_BIND_IP"] = config.defaults.publish_bind_ip
+            os.environ["OPENCLAW_K_CONNECT_HOST"] = config.defaults.connect_host
+
+            skills_host_dir = resolve_existing_dir(
+                config.defaults.skills_dir,
+                config_dir=config_dir,
+                field_name="defaults.skills_dir",
+            )
+            soul_host_file = (
+                resolve_existing_file(
+                    config.defaults.soul_file,
+                    config_dir=config_dir,
+                    required=False,
+                    field_name="defaults.soul_file",
+                )
+                if config.defaults.soul_file
+                else None
+            )
+            if skills_host_dir:
+                os.environ[DEFAULT_SKILLS_DIR_ENV] = str(skills_host_dir)
+            else:
+                os.environ.pop(DEFAULT_SKILLS_DIR_ENV, None)
+            if soul_host_file:
+                os.environ[DEFAULT_SOUL_FILE_ENV] = str(soul_host_file)
+            else:
+                os.environ.pop(DEFAULT_SOUL_FILE_ENV, None)
+
     token = args.token or os.getenv("OPENCLAW_K_API_TOKEN")
     if not token:
         raise ServiceError(400, "token_required", "Provide --token or set OPENCLAW_K_API_TOKEN.")
@@ -621,6 +1015,114 @@ def api_serve_cli(args: argparse.Namespace) -> None:
     import uvicorn
 
     uvicorn.run(app, host=args.host, port=args.port)
+
+
+def wait_for_api_health(host: str, port: int, timeout_seconds: int = 45) -> None:
+    url = f"http://127.0.0.1:{port}/health" if host in ("0.0.0.0", "::") else f"http://{host}:{port}/health"
+    deadline = time.time() + timeout_seconds
+    last_error = ""
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(url, timeout=3) as response:
+                if response.status == 200:
+                    return
+        except (urllib.error.URLError, ConnectionResetError, OSError) as exc:
+            last_error = str(exc)
+        time.sleep(1)
+    raise ServiceError(500, "api_not_ready", f"API did not become healthy at {url}. Last error: {last_error}")
+
+
+def up_cli(args: argparse.Namespace) -> None:
+    config, config_path = load_up_config(args.config)
+    config_dir = config_path.parent
+
+    api_token = os.getenv("OPENCLAW_K_API_TOKEN")
+    if not api_token:
+        raise ServiceError(400, "token_required", "OPENCLAW_K_API_TOKEN is required for 'openclaw-k up'.")
+
+    default_provider = config.providers.profiles[config.providers.default]
+    provider_host_file = resolve_existing_file(
+        default_provider.file,
+        config_dir=config_dir,
+        required=True,
+        field_name=f"providers.profiles.{config.providers.default}.file",
+    )
+    assert provider_host_file is not None
+
+    skills_host_dir = resolve_existing_dir(config.defaults.skills_dir, config_dir=config_dir, field_name="defaults.skills_dir")
+    soul_host_file = (
+        resolve_existing_file(config.defaults.soul_file, config_dir=config_dir, required=False, field_name="defaults.soul_file")
+        if config.defaults.soul_file
+        else None
+    )
+
+    docker_client = get_docker_client()
+
+    if not args.no_build:
+        try:
+            docker_client.images.build(path=str(config_dir), tag=config.docker.image_tag)
+        except APIError as exc:
+            raise ServiceError(500, "docker_build_failed", exc.explanation or str(exc)) from exc
+
+    # Idempotent replace of API container.
+    try:
+        existing = docker_client.containers.get(config.docker.container_name)
+        existing.remove(force=True)
+    except NotFound:
+        pass
+    except APIError as exc:
+        raise ServiceError(500, "docker_api_error", exc.explanation or str(exc)) from exc
+
+    provider_container_file = f"{INTERNAL_DEFAULTS_DIR}/provider-{config.providers.default}.json"
+    volumes: dict[str, dict[str, str]] = {
+        "/var/run/docker.sock": {"bind": "/var/run/docker.sock", "mode": "rw"},
+        str(provider_host_file): {"bind": provider_container_file, "mode": "ro"},
+    }
+    if skills_host_dir:
+        volumes[str(skills_host_dir)] = {"bind": f"{INTERNAL_DEFAULTS_DIR}/skills", "mode": "ro"}
+    if soul_host_file:
+        volumes[str(soul_host_file)] = {"bind": f"{INTERNAL_DEFAULTS_DIR}/SOUL.md", "mode": "ro"}
+
+    try:
+        docker_client.containers.run(
+            config.docker.image_tag,
+            name=config.docker.container_name,
+            detach=True,
+            restart_policy={"Name": "unless-stopped"},
+            ports={f"{config.api.port}/tcp": ("0.0.0.0", config.api.port)},
+            environment={
+                "OPENCLAW_K_API_TOKEN": api_token,
+                "OPENCLAW_K_DEFAULT_PROVIDER_FILE": provider_container_file,
+                "OPENCLAW_K_PUBLISH_BIND_IP": config.defaults.publish_bind_ip,
+                "OPENCLAW_K_CONNECT_HOST": config.defaults.connect_host,
+                **(
+                    {"OPENCLAW_K_DEFAULT_SKILLS_DIR": f"{INTERNAL_DEFAULTS_DIR}/skills"}
+                    if skills_host_dir
+                    else {}
+                ),
+                **(
+                    {"OPENCLAW_K_DEFAULT_SOUL_FILE": f"{INTERNAL_DEFAULTS_DIR}/SOUL.md"}
+                    if soul_host_file
+                    else {}
+                ),
+            },
+            volumes=volumes,
+            command=["api", "serve", "--host", config.api.host, "--port", str(config.api.port)],
+        )
+    except APIError as exc:
+        raise ServiceError(500, "docker_run_failed", exc.explanation or str(exc)) from exc
+
+    wait_for_api_health(config.api.host, config.api.port)
+
+    print("openclaw-k API is up.")
+    print(f"- Config: {config_path}")
+    print(f"- Container: {config.docker.container_name}")
+    print(f"- Image: {config.docker.image_tag}")
+    print(f"- API: http://{config.defaults.connect_host}:{config.api.port}/health")
+    print(f"- Default provider profile: {config.providers.default}")
+    print(f"- Provider file: {provider_host_file}")
+    print(f"- Skills dir: {skills_host_dir if skills_host_dir else 'not set or missing (skipped)'}")
+    print(f"- SOUL file: {soul_host_file if soul_host_file else 'not set or missing (skipped)'}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -637,6 +1139,10 @@ def build_parser() -> argparse.ArgumentParser:
     create_user_parser.add_argument("--port", type=int, required=True, help="Host port for this user")
     create_user_parser.add_argument("--key", help="Optional OpenClaw gateway token (auto-generated if omitted)")
     create_user_parser.add_argument(
+        "--provider",
+        help="Provider profile override from openclaw-k.yaml (supports profile name or provider file stem, e.g. openai or openclaw-openai).",
+    )
+    create_user_parser.add_argument(
         "--config-file",
         help="Path to openclaw.json to ingest. If omitted, './openclaw.json' is used when present.",
     )
@@ -652,12 +1158,12 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"OpenClaw image to run (default: {DEFAULT_OPENCLAW_IMAGE})",
     )
     create_user_parser.add_argument(
-        "--connect-host",
-        help=f"Host used in printed URLs (default: {DEFAULT_CONNECT_HOST})",
+        "--api-url",
+        help=f"openclaw-k API base URL (default: {DEFAULT_API_URL_ENV} or {DEFAULT_API_BASE_URL})",
     )
     create_user_parser.add_argument(
-        "--publish-bind-ip",
-        help=f"Bind IP for published OpenClaw ports (default: {DEFAULT_PUBLISH_BIND_IP})",
+        "--api-token",
+        help="API Bearer token (fallback: OPENCLAW_K_API_TOKEN env)",
     )
     create_user_parser.set_defaults(func=create_user_cli)
 
@@ -670,6 +1176,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Delete only the container and keep persistent volumes",
     )
+    delete_user_parser.add_argument(
+        "--api-url",
+        help=f"openclaw-k API base URL (default: {DEFAULT_API_URL_ENV} or {DEFAULT_API_BASE_URL})",
+    )
+    delete_user_parser.add_argument(
+        "--api-token",
+        help="API Bearer token (fallback: OPENCLAW_K_API_TOKEN env)",
+    )
     delete_user_parser.set_defaults(func=delete_user_cli)
 
     inspect_parser = subparsers.add_parser("inspect", help="Inspect resources")
@@ -677,14 +1191,26 @@ def build_parser() -> argparse.ArgumentParser:
     inspect_user_parser = inspect_sub.add_parser("user", help="Inspect an OpenClaw user container")
     inspect_user_parser.add_argument("username", help="User identifier")
     inspect_user_parser.add_argument(
-        "--connect-host",
-        help=f"Host used in returned URL/link fields (default: {DEFAULT_CONNECT_HOST})",
+        "--api-url",
+        help=f"openclaw-k API base URL (default: {DEFAULT_API_URL_ENV} or {DEFAULT_API_BASE_URL})",
+    )
+    inspect_user_parser.add_argument(
+        "--api-token",
+        help="API Bearer token (fallback: OPENCLAW_K_API_TOKEN env)",
     )
     inspect_user_parser.set_defaults(func=inspect_user_cli)
 
     list_parser = subparsers.add_parser("list", help="List resources")
     list_sub = list_parser.add_subparsers(dest="resource", required=True)
     list_user_parser = list_sub.add_parser("users", help="List openclaw-k-managed OpenClaw users")
+    list_user_parser.add_argument(
+        "--api-url",
+        help=f"openclaw-k API base URL (default: {DEFAULT_API_URL_ENV} or {DEFAULT_API_BASE_URL})",
+    )
+    list_user_parser.add_argument(
+        "--api-token",
+        help="API Bearer token (fallback: OPENCLAW_K_API_TOKEN env)",
+    )
     list_user_parser.set_defaults(func=list_users_cli)
 
     api_parser = subparsers.add_parser("api", help="Run HTTP API server")
@@ -696,7 +1222,25 @@ def build_parser() -> argparse.ArgumentParser:
         "--token",
         help="Admin API Bearer token (fallback: OPENCLAW_K_API_TOKEN env)",
     )
+    api_serve_parser.add_argument(
+        "--config",
+        default=DEFAULT_UP_CONFIG_FILE,
+        help=f"Optional YAML defaults file for provider/skills/soul (default: {DEFAULT_UP_CONFIG_FILE})",
+    )
     api_serve_parser.set_defaults(func=api_serve_cli)
+
+    up_parser = subparsers.add_parser("up", help="Bootstrap and run API container from config.yaml")
+    up_parser.add_argument(
+        "--config",
+        default=DEFAULT_UP_CONFIG_FILE,
+        help=f"Path to YAML config (default: {DEFAULT_UP_CONFIG_FILE})",
+    )
+    up_parser.add_argument(
+        "--no-build",
+        action="store_true",
+        help="Skip docker image build and reuse existing image tag from config",
+    )
+    up_parser.set_defaults(func=up_cli)
 
     return parser
 
