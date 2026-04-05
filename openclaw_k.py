@@ -1292,11 +1292,15 @@ def create_api_app(admin_token: str) -> FastAPI:
 
         if has_images:
             # Route through Ollama native /api/chat for vision support
-            # Find Ollama URL from provider config
-            ollama_url = "http://172.17.0.1:11434"  # default docker bridge
+            ollama_url = os.getenv("OPENCLAW_K_OLLAMA_URL", "http://172.17.0.1:11434")
+            ollama_model = os.getenv("OPENCLAW_K_OLLAMA_MODEL", "gemma4:e4b")
+            ollama_headers = {}
+            ollama_auth_token = os.getenv("OPENCLAW_K_OLLAMA_AUTH_TOKEN", "")
+            if ollama_auth_token:
+                ollama_headers["Authorization"] = f"Bearer {ollama_auth_token}"
 
             payload = {
-                "model": request.model if request.model != "openclaw" else "gemma4:e4b",
+                "model": request.model if request.model != "openclaw" else ollama_model,
                 "messages": ollama_messages,
                 "stream": request.stream,
             }
@@ -1305,6 +1309,7 @@ def create_api_app(admin_token: str) -> FastAPI:
                 resp = httpx.post(
                     f"{ollama_url}/api/chat",
                     json=payload,
+                    headers=ollama_headers if ollama_headers else None,
                     timeout=120.0,
                 )
                 return resp.json()
