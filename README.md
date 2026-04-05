@@ -113,6 +113,122 @@ Auth for all `/v1/*` routes:
 - `GET /v1/users/{username}`: inspect user
 - `DELETE /v1/users/{username}?keep_data=false`: delete user
 
+## API Examples
+
+Set variables:
+
+```bash
+API="http://34.16.127.240:8787"
+TOKEN="REPLACE_ME"
+AUTH="Authorization: Bearer $TOKEN"
+```
+
+Health:
+
+```bash
+curl -s "$API/health"
+```
+
+Expected:
+
+```json
+{"ok":true,"service":"openclaw-k-api"}
+```
+
+Create user:
+
+```bash
+curl -s -X POST "$API/v1/users" \
+  -H "$AUTH" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "username": "alice",
+    "port": 19111,
+    "provider": "openclaw-openai",
+    "wait_timeout_seconds": 300
+  }'
+```
+
+Expected (example):
+
+```json
+{
+  "user": "alice",
+  "container": "openclaw-alice",
+  "status": "ready",
+  "port": 19111,
+  "url": "http://34.16.127.240:19111/",
+  "connect_link": "http://34.16.127.240:19111/#token=...",
+  "token": "...",
+  "image": "ghcr.io/openclaw/openclaw:latest",
+  "config_ingested": true
+}
+```
+
+List users:
+
+```bash
+curl -s -H "$AUTH" "$API/v1/users"
+```
+
+Expected (example):
+
+```json
+{
+  "items": [
+    {
+      "user": "alice",
+      "container": "openclaw-alice",
+      "status": "running",
+      "health": "healthy",
+      "ready": true,
+      "port": 19111
+    }
+  ]
+}
+```
+
+Inspect user:
+
+```bash
+curl -s -H "$AUTH" "$API/v1/users/alice"
+```
+
+Expected (example):
+
+```json
+{
+  "user": "alice",
+  "container": "openclaw-alice",
+  "status": "running",
+  "ready": true,
+  "port": 19111,
+  "url": "http://34.16.127.240:19111/",
+  "connect_link": "http://34.16.127.240:19111/#token=..."
+}
+```
+
+Delete user:
+
+```bash
+curl -s -X DELETE -H "$AUTH" "$API/v1/users/alice?keep_data=false"
+```
+
+Expected (example):
+
+```json
+{
+  "user": "alice",
+  "container_deleted": true,
+  "volumes_deleted": [
+    "openclaw-config-alice",
+    "openclaw-workspace-alice",
+    "openclaw-skills-alice"
+  ],
+  "keep_data": false
+}
+```
+
 OpenAPI:
 
 - `/docs`
