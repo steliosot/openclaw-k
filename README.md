@@ -37,6 +37,12 @@ Start the API server:
 openclaw-k api serve --host 0.0.0.0 --port 8787
 ```
 
+Recommended for VM/server (loads providers from YAML and recreates API container):
+
+```bash
+openclaw-k up --config ./openclaw-k.yaml
+```
+
 Health check:
 
 ```bash
@@ -51,6 +57,13 @@ Create user:
 
 ```bash
 openclaw-k create user alice --port 19111
+```
+
+Create user with provider override (from `openclaw-k.yaml` profiles):
+
+```bash
+openclaw-k create user alice --port 19111 --provider openclaw-openai
+openclaw-k create user bob --port 19112 --provider openclaw-gemma4
 ```
 
 Inspect user:
