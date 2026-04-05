@@ -508,7 +508,9 @@ def put_file_into_container(container: docker.models.containers.Container, dest_
     with tarfile.open(fileobj=archive_stream, mode="w") as tar:
         info = tarfile.TarInfo(name=name)
         info.size = len(content)
-        info.mode = 0o600
+        info.mode = 0o644
+        info.uid = 1000   # node user
+        info.gid = 1000   # node group
         tar.addfile(info, io.BytesIO(content))
     archive_stream.seek(0)
     ok = container.put_archive(dest_dir, archive_stream.getvalue())
