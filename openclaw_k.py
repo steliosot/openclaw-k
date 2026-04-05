@@ -1229,7 +1229,7 @@ def create_api_app(admin_token: str) -> FastAPI:
         """
         import httpx
 
-        user = ManagedUser(username)
+        user = UserContainer(username)
         try:
             container = docker.from_env().containers.get(user.container_name)
         except NotFound:
@@ -1335,7 +1335,7 @@ def create_api_app(admin_token: str) -> FastAPI:
         import base64
         import posixpath
 
-        user = ManagedUser(username)
+        user = UserContainer(username)
         try:
             container = docker.from_env().containers.get(user.container_name)
         except NotFound:
