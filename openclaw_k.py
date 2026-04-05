@@ -1325,9 +1325,10 @@ def create_api_app(admin_token: str) -> FastAPI:
             if request.user:
                 payload["user"] = request.user
 
+            chat_host = os.getenv("OPENCLAW_K_CONNECT_HOST", "127.0.0.1")
             try:
                 resp = httpx.post(
-                    f"http://127.0.0.1:{port}/v1/chat/completions",
+                    f"http://{chat_host}:{port}/v1/chat/completions",
                     json=payload,
                     headers={"Authorization": f"Bearer {token}"},
                     timeout=120.0,
