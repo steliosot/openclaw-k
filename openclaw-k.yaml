@@ -19,3 +19,4 @@ defaults:
   connect_host: 34.16.127.240
   skills_dir: ./skills
   soul_file: ./SOUL.md
+  workspace_dir: ./workspace

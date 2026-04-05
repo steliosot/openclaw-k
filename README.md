@@ -14,6 +14,8 @@ OpenClaw image used: `ghcr.io/openclaw/openclaw:latest`
   - nested folders/scripts are supported
 - SOUL injection at user creation:
   - optional copy from `defaults.soul_file` into `/home/node/.openclaw/workspace/SOUL.md`
+- Workspace injection at user creation:
+  - optional recursive copy from `defaults.workspace_dir` into `/home/node/.openclaw/workspace`
 
 ## Install
 
@@ -89,6 +91,14 @@ List users:
 openclaw-k list users
 ```
 
+Update all running users with latest provider/skills/SOUL/workspace:
+
+```bash
+openclaw-k update all
+openclaw-k update all --provider openclaw-openai
+openclaw-k update all --user alice --user bob
+```
+
 Delete user:
 
 ```bash
@@ -112,6 +122,7 @@ Auth for all `/v1/*` routes:
 - `GET /v1/users`: list users
 - `GET /v1/users/{username}`: inspect user
 - `DELETE /v1/users/{username}?keep_data=false`: delete user
+- `POST /v1/update/all`: update all running managed users with latest provider/skills/SOUL/workspace
 
 ## API Examples
 
@@ -226,6 +237,41 @@ Expected (example):
     "openclaw-skills-alice"
   ],
   "keep_data": false
+}
+```
+
+Update all running users:
+
+```bash
+curl -s -X POST "$API/v1/update/all" \
+  -H "$AUTH" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "provider": "openclaw-openai",
+    "restart": true,
+    "wait_timeout_seconds": 300
+  }'
+```
+
+Expected (example):
+
+```json
+{
+  "ok": true,
+  "total": 2,
+  "updated": 2,
+  "failed": 0,
+  "items": [
+    {
+      "user": "alice",
+      "container": "openclaw-alice",
+      "updated": true,
+      "restarted": true,
+      "ready": true,
+      "applied": {"config": true, "skills": true, "soul": true, "workspace": true},
+      "errors": []
+    }
+  ]
 }
 ```
 

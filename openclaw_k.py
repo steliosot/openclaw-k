@@ -62,6 +62,7 @@ DEFAULT_PROVIDER_FILE_ENV = "OPENCLAW_K_DEFAULT_PROVIDER_FILE"
 DEFAULT_CONFIG_FILE_ENV = "OPENCLAW_K_DEFAULT_CONFIG_FILE"  # backwards-compatible alias
 DEFAULT_SKILLS_DIR_ENV = "OPENCLAW_K_DEFAULT_SKILLS_DIR"
 DEFAULT_SOUL_FILE_ENV = "OPENCLAW_K_DEFAULT_SOUL_FILE"
+DEFAULT_WORKSPACE_DIR_ENV = "OPENCLAW_K_DEFAULT_WORKSPACE_DIR"
 DEFAULT_UP_CONFIG_FILE = "openclaw-k.yaml"
 INTERNAL_DEFAULTS_DIR = "/app/defaults"
 DEFAULT_API_BASE_URL = f"http://127.0.0.1:{DEFAULT_API_PORT}"
@@ -156,6 +157,31 @@ class DeleteUserResponse(BaseModel):
     keep_data: bool
 
 
+class UpdateAllRequest(BaseModel):
+    users: list[str] | None = None
+    provider: str | None = None
+    restart: bool = True
+    wait_timeout_seconds: int = Field(default=DEFAULT_WAIT_TIMEOUT_SECONDS, ge=5, le=3600)
+
+
+class UpdateAllItem(BaseModel):
+    user: str
+    container: str
+    updated: bool
+    restarted: bool
+    ready: bool
+    applied: dict[str, bool]
+    errors: list[str]
+
+
+class UpdateAllResponse(BaseModel):
+    ok: bool
+    total: int
+    updated: int
+    failed: int
+    items: list[UpdateAllItem]
+
+
 def resolve_api_base_url(api_url_arg: str | None) -> str:
     return (api_url_arg or os.getenv(DEFAULT_API_URL_ENV) or DEFAULT_API_BASE_URL).rstrip("/")
 
@@ -239,6 +265,7 @@ class DefaultsConfig(BaseModel):
     connect_host: str = "127.0.0.1"
     skills_dir: str | None = None
     soul_file: str | None = None
+    workspace_dir: str | None = None
 
 
 class UpConfig(BaseModel):
@@ -420,12 +447,14 @@ def resolve_config_file_path(config_file_arg: str | None, provider_arg: str | No
     return None
 
 
-def resolve_optional_defaults() -> tuple[Path | None, Path | None]:
+def resolve_optional_defaults() -> tuple[Path | None, Path | None, Path | None]:
     skills_dir_env = os.getenv(DEFAULT_SKILLS_DIR_ENV)
     soul_file_env = os.getenv(DEFAULT_SOUL_FILE_ENV)
+    workspace_dir_env = os.getenv(DEFAULT_WORKSPACE_DIR_ENV)
 
     skills_path: Path | None = None
     soul_path: Path | None = None
+    workspace_path: Path | None = None
 
     if skills_dir_env:
         p = Path(skills_dir_env).expanduser().resolve()
@@ -435,8 +464,12 @@ def resolve_optional_defaults() -> tuple[Path | None, Path | None]:
         p = Path(soul_file_env).expanduser().resolve()
         if p.exists() and p.is_file():
             soul_path = p
+    if workspace_dir_env:
+        p = Path(workspace_dir_env).expanduser().resolve()
+        if p.exists() and p.is_dir():
+            workspace_path = p
 
-    return skills_path, soul_path
+    return skills_path, soul_path, workspace_path
 
 
 def put_file_into_container(container: docker.models.containers.Container, dest_dir: str, name: str, content: bytes) -> None:
@@ -528,6 +561,7 @@ def seed_openclaw_state(
     config_file_path: Path | None,
     skills_dir_path: Path | None,
     soul_file_path: Path | None,
+    workspace_dir_path: Path | None,
 ) -> None:
     run_in_seed_container(
         client,
@@ -535,7 +569,7 @@ def seed_openclaw_state(
         volume_mounts,
         ["sh", "-lc", "mkdir -p /home/node/.openclaw/workspace && chown -R 1000:1000 /home/node/.openclaw"],
     )
-    if not config_file_path and not skills_dir_path and not soul_file_path:
+    if not config_file_path and not skills_dir_path and not soul_file_path and not workspace_dir_path:
         return
 
     seed = client.containers.create(
@@ -549,14 +583,18 @@ def seed_openclaw_state(
         if config_file_path:
             config_content = with_openai_api_key(config_file_path.read_bytes())
             put_file_into_container(seed, "/home/node/.openclaw", "openclaw.json", config_content)
-        if soul_file_path:
-            put_file_into_container(seed, "/home/node/.openclaw/workspace", "SOUL.md", soul_file_path.read_bytes())
         if skills_dir_path:
             put_directory_into_container(seed, skills_dir_path, "/app/skills")
+        if workspace_dir_path:
+            put_directory_into_container(seed, workspace_dir_path, "/home/node/.openclaw/workspace")
+        # Explicit soul_file overrides workspace_dir/SOUL.md if both are set.
+        if soul_file_path:
+            put_file_into_container(seed, "/home/node/.openclaw/workspace", "SOUL.md", soul_file_path.read_bytes())
 
         chown_cmd = (
             "if [ -f /home/node/.openclaw/openclaw.json ]; then chown 1000:1000 /home/node/.openclaw/openclaw.json && chmod 600 /home/node/.openclaw/openclaw.json; fi; "
             "if [ -f /home/node/.openclaw/workspace/SOUL.md ]; then chown 1000:1000 /home/node/.openclaw/workspace/SOUL.md && chmod 644 /home/node/.openclaw/workspace/SOUL.md; fi; "
+            "if [ -d /home/node/.openclaw/workspace ]; then chown -R 1000:1000 /home/node/.openclaw/workspace; fi; "
             "if [ -d /app/skills ]; then chown -R 1000:1000 /app/skills; fi"
         )
         chown_result = seed.exec_run(["sh", "-lc", chown_cmd])
@@ -695,8 +733,8 @@ def create_user_service(
             user.workspace_volume: {"bind": "/home/node/.openclaw/workspace", "mode": "rw"},
             user.skills_volume: {"bind": "/app/skills", "mode": "rw"},
         }
-        skills_dir_path, soul_file_path = resolve_optional_defaults()
-        seed_openclaw_state(client, image, volume_mounts, config_file_path, skills_dir_path, soul_file_path)
+        skills_dir_path, soul_file_path, workspace_dir_path = resolve_optional_defaults()
+        seed_openclaw_state(client, image, volume_mounts, config_file_path, skills_dir_path, soul_file_path, workspace_dir_path)
 
         container = client.containers.run(
             image,
@@ -819,6 +857,125 @@ def delete_user_service(*, username: str, keep_data: bool = False) -> dict[str, 
     }
 
 
+def _sync_skills_mirror(container: docker.models.containers.Container, skills_dir_path: Path) -> None:
+    wipe = container.exec_run(["sh", "-lc", "mkdir -p /app/skills && rm -rf /app/skills/*"], user="0:0")
+    if wipe.exit_code != 0:
+        raise ServiceError(500, "skills_sync_failed", "Failed to clean /app/skills before sync.")
+    put_directory_into_container(container, skills_dir_path, "/app/skills")
+
+
+def _sync_workspace_mirror(container: docker.models.containers.Container, workspace_dir_path: Path) -> None:
+    wipe = container.exec_run(
+        ["sh", "-lc", "mkdir -p /home/node/.openclaw/workspace && find /home/node/.openclaw/workspace -mindepth 1 -delete"],
+        user="0:0",
+    )
+    if wipe.exit_code != 0:
+        raise ServiceError(500, "workspace_sync_failed", "Failed to clean workspace before sync.")
+    put_directory_into_container(container, workspace_dir_path, "/home/node/.openclaw/workspace")
+
+
+def update_all_service(
+    *,
+    users: list[str] | None = None,
+    provider: str | None = None,
+    restart: bool = True,
+    wait_timeout_seconds: int = DEFAULT_WAIT_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    client = get_docker_client()
+    running = client.containers.list(all=False, filters={"label": "managed-by=openclaw-k"})
+    requested_users = set(users or [])
+    targets: list[docker.models.containers.Container] = []
+    for container in running:
+        container_user = container.labels.get("openclaw-k.user")
+        if not container_user:
+            continue
+        if requested_users and container_user not in requested_users:
+            continue
+        targets.append(container)
+
+    if not targets:
+        raise ServiceError(404, "no_running_users", "No running openclaw-k-managed users matched the request.")
+
+    config_file_path = resolve_config_file_path(None, provider)
+    skills_dir_path, soul_file_path, workspace_dir_path = resolve_optional_defaults()
+
+    items: list[dict[str, Any]] = []
+    updated_count = 0
+    failed_count = 0
+
+    for container in targets:
+        container.reload()
+        user = container.labels.get("openclaw-k.user", "unknown")
+        item = {
+            "user": user,
+            "container": container.name,
+            "updated": False,
+            "restarted": False,
+            "ready": False,
+            "applied": {"config": False, "skills": False, "soul": False, "workspace": False},
+            "errors": [],
+        }
+        try:
+            if config_file_path:
+                config_content = with_openai_api_key(config_file_path.read_bytes())
+                put_file_into_container(container, "/home/node/.openclaw", "openclaw.json", config_content)
+                item["applied"]["config"] = True
+
+            if skills_dir_path:
+                _sync_skills_mirror(container, skills_dir_path)
+                item["applied"]["skills"] = True
+
+            if workspace_dir_path:
+                _sync_workspace_mirror(container, workspace_dir_path)
+                item["applied"]["workspace"] = True
+
+            if soul_file_path:
+                put_file_into_container(container, "/home/node/.openclaw/workspace", "SOUL.md", soul_file_path.read_bytes())
+                item["applied"]["soul"] = True
+
+            chown_cmd = (
+                "if [ -f /home/node/.openclaw/openclaw.json ]; then chown 1000:1000 /home/node/.openclaw/openclaw.json && chmod 600 /home/node/.openclaw/openclaw.json; fi; "
+                "if [ -f /home/node/.openclaw/workspace/SOUL.md ]; then chown 1000:1000 /home/node/.openclaw/workspace/SOUL.md && chmod 644 /home/node/.openclaw/workspace/SOUL.md; fi; "
+                "if [ -d /home/node/.openclaw/workspace ]; then chown -R 1000:1000 /home/node/.openclaw/workspace; fi; "
+                "if [ -d /app/skills ]; then chown -R 1000:1000 /app/skills; fi"
+            )
+            chown_result = container.exec_run(["sh", "-lc", chown_cmd], user="0:0")
+            if chown_result.exit_code != 0:
+                raise ServiceError(500, "config_permissions_failed", "Could not set permissions on updated defaults.")
+
+            if restart:
+                container.restart()
+                item["restarted"] = True
+                wait_until_ready(container, timeout_seconds=wait_timeout_seconds)
+                item["ready"] = True
+            else:
+                item["ready"] = is_gateway_live(container) and has_model_synced(container)
+
+            item["updated"] = True
+            updated_count += 1
+        except ServiceError as exc:
+            failed_count += 1
+            item["errors"].append(exc.message)
+        except APIError as exc:
+            failed_count += 1
+            item["errors"].append(exc.explanation or str(exc))
+        except Exception as exc:
+            failed_count += 1
+            item["errors"].append(str(exc))
+        items.append(item)
+
+    payload = {
+        "ok": failed_count == 0,
+        "total": len(items),
+        "updated": updated_count,
+        "failed": failed_count,
+        "items": items,
+    }
+    if updated_count == 0:
+        raise ServiceError(500, "all_updates_failed", "Failed to update all targeted containers.", payload)
+    return payload
+
+
 def create_user_cli(args: argparse.Namespace) -> None:
     api_base_url = resolve_api_base_url(args.api_url)
     api_token = resolve_api_token(args.api_token)
@@ -920,6 +1077,36 @@ def delete_user_cli(args: argparse.Namespace) -> None:
             print("No volumes removed (not found).")
 
 
+def update_all_cli(args: argparse.Namespace) -> None:
+    api_base_url = resolve_api_base_url(args.api_url)
+    api_token = resolve_api_token(args.api_token)
+    payload = {
+        "users": args.users or None,
+        "provider": args.provider,
+        "restart": not args.no_restart,
+        "wait_timeout_seconds": args.wait_timeout,
+    }
+    result = api_request(
+        method="POST",
+        path="/v1/update/all",
+        api_base_url=api_base_url,
+        api_token=api_token,
+        json_body={k: v for k, v in payload.items() if v is not None},
+    )
+
+    print(
+        f"Update complete: total={result['total']} updated={result['updated']} failed={result['failed']}"
+    )
+    for item in result.get("items", []):
+        status = "ok" if item.get("updated") else "failed"
+        print(
+            f"- {item.get('user')} ({item.get('container')}): {status}, "
+            f"applied={item.get('applied')}, restarted={item.get('restarted')}, ready={item.get('ready')}"
+        )
+        for err in item.get("errors", []):
+            print(f"  error: {err}")
+
+
 def build_auth_dependency(admin_token: str):
     def require_bearer(authorization: str | None = Header(default=None, alias="Authorization")) -> None:
         if not authorization:
@@ -992,6 +1179,15 @@ def create_api_app(admin_token: str) -> FastAPI:
     def delete_user_endpoint(username: str, keep_data: bool = False) -> dict[str, Any]:
         return delete_user_service(username=username, keep_data=keep_data)
 
+    @app.post("/v1/update/all", response_model=UpdateAllResponse, dependencies=[Depends(require_bearer)])
+    def update_all_endpoint(request: UpdateAllRequest) -> dict[str, Any]:
+        return update_all_service(
+            users=request.users,
+            provider=request.provider,
+            restart=request.restart,
+            wait_timeout_seconds=request.wait_timeout_seconds,
+        )
+
     return app
 
 
@@ -1041,6 +1237,11 @@ def api_serve_cli(args: argparse.Namespace) -> None:
                 if config.defaults.soul_file
                 else None
             )
+            workspace_host_dir = resolve_existing_dir(
+                config.defaults.workspace_dir,
+                config_dir=config_dir,
+                field_name="defaults.workspace_dir",
+            )
             if skills_host_dir:
                 os.environ[DEFAULT_SKILLS_DIR_ENV] = str(skills_host_dir)
             else:
@@ -1049,6 +1250,10 @@ def api_serve_cli(args: argparse.Namespace) -> None:
                 os.environ[DEFAULT_SOUL_FILE_ENV] = str(soul_host_file)
             else:
                 os.environ.pop(DEFAULT_SOUL_FILE_ENV, None)
+            if workspace_host_dir:
+                os.environ[DEFAULT_WORKSPACE_DIR_ENV] = str(workspace_host_dir)
+            else:
+                os.environ.pop(DEFAULT_WORKSPACE_DIR_ENV, None)
 
     token = args.token or os.getenv("OPENCLAW_K_API_TOKEN")
     if not token:
@@ -1101,6 +1306,11 @@ def up_cli(args: argparse.Namespace) -> None:
         if config.defaults.soul_file
         else None
     )
+    workspace_host_dir = resolve_existing_dir(
+        config.defaults.workspace_dir,
+        config_dir=config_dir,
+        field_name="defaults.workspace_dir",
+    )
 
     docker_client = get_docker_client()
 
@@ -1135,6 +1345,8 @@ def up_cli(args: argparse.Namespace) -> None:
         volumes[str(skills_host_dir)] = {"bind": f"{INTERNAL_DEFAULTS_DIR}/skills", "mode": "ro"}
     if soul_host_file:
         volumes[str(soul_host_file)] = {"bind": f"{INTERNAL_DEFAULTS_DIR}/SOUL.md", "mode": "ro"}
+    if workspace_host_dir:
+        volumes[str(workspace_host_dir)] = {"bind": f"{INTERNAL_DEFAULTS_DIR}/workspace", "mode": "ro"}
 
     try:
         docker_client.containers.run(
@@ -1159,6 +1371,11 @@ def up_cli(args: argparse.Namespace) -> None:
                     if soul_host_file
                     else {}
                 ),
+                **(
+                    {"OPENCLAW_K_DEFAULT_WORKSPACE_DIR": f"{INTERNAL_DEFAULTS_DIR}/workspace"}
+                    if workspace_host_dir
+                    else {}
+                ),
             },
             volumes=volumes,
             command=["api", "serve", "--host", config.api.host, "--port", str(config.api.port)],
@@ -1177,6 +1394,7 @@ def up_cli(args: argparse.Namespace) -> None:
     print(f"- Provider file: {provider_host_file}")
     print(f"- Skills dir: {skills_host_dir if skills_host_dir else 'not set or missing (skipped)'}")
     print(f"- SOUL file: {soul_host_file if soul_host_file else 'not set or missing (skipped)'}")
+    print(f"- Workspace dir: {workspace_host_dir if workspace_host_dir else 'not set or missing (skipped)'}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1266,6 +1484,41 @@ def build_parser() -> argparse.ArgumentParser:
         help="API Bearer token (fallback: OPENCLAW_K_API_TOKEN env)",
     )
     list_user_parser.set_defaults(func=list_users_cli)
+
+    update_parser = subparsers.add_parser("update", help="Update running resources")
+    update_sub = update_parser.add_subparsers(dest="resource", required=True)
+    update_all_parser = update_sub.add_parser("all", help="Update all running managed users with latest config/skills/SOUL")
+    update_all_parser.add_argument(
+        "--user",
+        dest="users",
+        action="append",
+        default=[],
+        help="Optional user filter. Repeat to target multiple users.",
+    )
+    update_all_parser.add_argument(
+        "--provider",
+        help="Optional provider override alias (same resolution as create --provider).",
+    )
+    update_all_parser.add_argument(
+        "--no-restart",
+        action="store_true",
+        help="Apply files without restarting containers.",
+    )
+    update_all_parser.add_argument(
+        "--wait-timeout",
+        type=int,
+        default=DEFAULT_WAIT_TIMEOUT_SECONDS,
+        help=f"Seconds to wait for readiness after restart (default: {DEFAULT_WAIT_TIMEOUT_SECONDS}).",
+    )
+    update_all_parser.add_argument(
+        "--api-url",
+        help=f"openclaw-k API base URL (default: {DEFAULT_API_URL_ENV} or {DEFAULT_API_BASE_URL})",
+    )
+    update_all_parser.add_argument(
+        "--api-token",
+        help="API Bearer token (fallback: OPENCLAW_K_API_TOKEN env)",
+    )
+    update_all_parser.set_defaults(func=update_all_cli)
 
     api_parser = subparsers.add_parser("api", help="Run HTTP API server")
     api_sub = api_parser.add_subparsers(dest="resource", required=True)

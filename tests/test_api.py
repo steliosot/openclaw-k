@@ -87,6 +87,49 @@ class ClawctlApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 409)
         self.assertEqual(response.json()["error"]["code"], "user_exists")
 
+    @patch("openclaw_k.update_all_service")
+    def test_update_all_success(self, mock_update_all_service) -> None:
+        mock_update_all_service.return_value = {
+            "ok": True,
+            "total": 1,
+            "updated": 1,
+            "failed": 0,
+            "items": [
+                {
+                    "user": "alice",
+                    "container": "openclaw-alice",
+                    "updated": True,
+                    "restarted": True,
+                    "ready": True,
+                    "applied": {"config": True, "skills": True, "soul": False},
+                    "errors": [],
+                }
+            ],
+        }
+        response = self.client.post(
+            "/v1/update/all",
+            headers=self.auth,
+            json={},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["updated"], 1)
+
+    @patch("openclaw_k.update_all_service")
+    def test_update_all_all_failed(self, mock_update_all_service) -> None:
+        mock_update_all_service.side_effect = openclaw_k.ServiceError(
+            500,
+            "all_updates_failed",
+            "Failed to update all targeted containers.",
+            {"ok": False, "total": 1, "updated": 0, "failed": 1, "items": []},
+        )
+        response = self.client.post(
+            "/v1/update/all",
+            headers=self.auth,
+            json={},
+        )
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.json()["error"]["code"], "all_updates_failed")
+
 
 if __name__ == "__main__":
     unittest.main()
