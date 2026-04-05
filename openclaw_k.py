@@ -157,6 +157,18 @@ class DeleteUserResponse(BaseModel):
     keep_data: bool
 
 
+class WriteFileRequest(BaseModel):
+    path: str = Field(min_length=1, max_length=512, description="Relative path inside workspace (e.g. uploads/image.png)")
+    content: str = Field(description="Base64-encoded file content")
+    model_config = ConfigDict(extra="forbid")
+
+
+class WriteFileResponse(BaseModel):
+    status: str
+    path: str
+    user: str
+
+
 class UpdateAllRequest(BaseModel):
     users: list[str] | None = None
     provider: str | None = None
@@ -1187,6 +1199,39 @@ def create_api_app(admin_token: str) -> FastAPI:
             restart=request.restart,
             wait_timeout_seconds=request.wait_timeout_seconds,
         )
+
+    @app.put("/v1/users/{username}/files", response_model=WriteFileResponse, dependencies=[Depends(require_bearer)])
+    def write_file_endpoint(username: str, request: WriteFileRequest) -> dict[str, Any]:
+        """Write a file into a running container's workspace directory."""
+        import base64
+        import posixpath
+
+        user = ManagedUser(username)
+        try:
+            container = docker.from_env().containers.get(user.container_name)
+        except NotFound:
+            raise ServiceError(404, "user_not_found", f"User '{username}' not found.")
+
+        # Decode base64 content
+        try:
+            content_bytes = base64.b64decode(request.content)
+        except Exception:
+            raise ServiceError(400, "invalid_content", "Content must be valid base64.")
+
+        # Ensure parent directories exist via the file path
+        workspace_base = "/home/node/.openclaw/workspace"
+        dest_path = posixpath.join(workspace_base, request.path)
+        dest_dir = posixpath.dirname(dest_path)
+        file_name = posixpath.basename(dest_path)
+
+        # Create parent dirs if needed
+        if dest_dir != workspace_base:
+            container.exec_run(["mkdir", "-p", dest_dir])
+
+        # Write file using Docker's put_archive (same approach as SOUL injection)
+        put_file_into_container(container, dest_dir, file_name, content_bytes)
+
+        return {"status": "ok", "path": request.path, "user": username}
 
     return app
 
