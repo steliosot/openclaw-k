@@ -169,6 +169,20 @@ class WriteFileResponse(BaseModel):
     user: str
 
 
+class DeviceIdentityResponse(BaseModel):
+    """Device identity files read from inside a running openclaw container.
+
+    `identity` is a flat, best-effort projection of common field names that
+    Maestro-style clients look for (deviceId, operatorToken, publicKey,
+    privateKey). `raw` preserves the original file contents so clients can
+    adapt if openclaw's on-disk schema changes.
+    """
+    user: str
+    identity: dict[str, Any]
+    raw: dict[str, Any]
+    model_config = ConfigDict(extra="allow")
+
+
 class ChatMessage(BaseModel):
     role: str
     content: Any  # string or array of content parts
@@ -694,13 +708,121 @@ def read_user_info(client: docker.DockerClient, username: str) -> tuple[docker.m
     return container, user
 
 
-def safe_set_config(container: docker.models.containers.Container, path: str, value: str) -> None:
+def safe_set_config(
+    container: docker.models.containers.Container,
+    path: str,
+    value: str,
+    *,
+    optional: bool = False,
+) -> None:
     result = container.exec_run(
         ["node", "dist/index.js", "config", "set", path, value, "--strict-json"],
         demux=False,
     )
     if result.exit_code != 0:
+        if optional:
+            # Some config keys are version-dependent; if the container's openclaw
+            # build no longer accepts this key, log and continue rather than
+            # failing provisioning. The container is healthy; this is cosmetic.
+            detail = (result.output or b"").decode("utf-8", errors="replace").strip()
+            print(
+                f"[openclaw-k] warning: optional config '{path}' not set "
+                f"(exit={result.exit_code}): {detail[:200]}",
+                flush=True,
+            )
+            return
         raise ServiceError(500, "config_set_failed", f"Failed to set config '{path}'.")
+
+
+def get_device_identity_service(username: str) -> dict[str, Any]:
+    """Read a container's device identity + pairing files from its config volume.
+
+    Openclaw writes device identity JSON (deviceId, keypair) and pairing info
+    (operatorToken) under /home/node/.openclaw shortly after first boot. Paths
+    and field names vary between openclaw versions, so we:
+
+      1. Probe a handful of likely paths via `docker exec cat`.
+      2. Additionally scan /home/node/.openclaw/identity and .../devices for
+         any *.json files we didn't hardcode.
+      3. Flatten common field names (deviceId/operatorToken/publicKey/
+         privateKey, plus snake_case variants) into `identity`.
+      4. Return the full raw contents so Maestro-side code can adapt if
+         names drift.
+
+    Returns 404 if the container is missing; 409 if no identity files were
+    found (container may still be initializing).
+    """
+    user = UserContainer(username)
+    client = get_docker_client()
+    try:
+        container = client.containers.get(user.container_name)
+    except NotFound as exc:
+        raise ServiceError(404, "user_not_found", f"User '{username}' not found.") from exc
+
+    candidate_paths = [
+        "/home/node/.openclaw/identity/device.json",
+        "/home/node/.openclaw/devices/paired.json",
+        "/home/node/.openclaw/device.json",
+        "/home/node/.openclaw/identity.json",
+    ]
+
+    collected: dict[str, Any] = {}
+
+    def _try_read(path: str) -> None:
+        if path in collected:
+            return
+        result = container.exec_run(["cat", path], demux=False)
+        if result.exit_code != 0:
+            return
+        try:
+            raw = (result.output or b"").decode("utf-8")
+            parsed = json.loads(raw)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return
+        collected[path] = parsed
+
+    for path in candidate_paths:
+        _try_read(path)
+
+    discover = container.exec_run(
+        [
+            "sh", "-c",
+            "find /home/node/.openclaw/identity /home/node/.openclaw/devices "
+            "-maxdepth 3 -type f -name '*.json' 2>/dev/null || true",
+        ],
+        demux=False,
+    )
+    if discover.exit_code == 0:
+        extra_paths = (discover.output or b"").decode("utf-8", errors="replace").strip().splitlines()
+        for path in extra_paths:
+            path = path.strip()
+            if path:
+                _try_read(path)
+
+    if not collected:
+        raise ServiceError(
+            409,
+            "device_not_ready",
+            f"Device identity files not yet written for '{username}' — try again in a moment.",
+        )
+
+    flat: dict[str, Any] = {}
+    interesting_fields = (
+        "deviceId", "device_id",
+        "operatorToken", "operator_token",
+        "privateKey", "private_key",
+        "devicePrivateKey", "device_private_key",
+        "publicKey", "public_key",
+        "devicePublicKey", "device_public_key",
+    )
+    for doc in collected.values():
+        if not isinstance(doc, dict):
+            continue
+        for field in interesting_fields:
+            if field in doc and field not in flat:
+                flat[field] = doc[field]
+
+    return {"user": username, "identity": flat, "raw": collected}
 
 
 def extract_host_port(container: docker.models.containers.Container) -> int | None:
@@ -783,7 +905,10 @@ def create_user_service(
 
         safe_set_config(container, "gateway.controlUi.allowedOrigins", f'["http://127.0.0.1:{port}","http://localhost:{port}"]')
         safe_set_config(container, "gateway.controlUi.dangerouslyAllowHostHeaderOriginFallback", "true")
-        safe_set_config(container, "gateway.controlUi.dangerouslyDisableDeviceAuth", "true")
+        # Optional: newer openclaw builds no longer accept this key (MAE-6).
+        # Treat as best-effort — the container still boots and is healthy
+        # regardless, and device auth is desirable anyway for the WebSocket flow.
+        safe_set_config(container, "gateway.controlUi.dangerouslyDisableDeviceAuth", "true", optional=True)
         container.restart()
         wait_until_ready(container, timeout_seconds=wait_timeout_seconds)
         container.reload()
@@ -1336,6 +1461,20 @@ def create_api_app(admin_token: str) -> FastAPI:
                 return resp.json()
             except Exception as exc:
                 raise ServiceError(502, "openclaw_error", f"OpenClaw request failed: {exc}")
+
+    @app.get("/v1/users/{username}/device", response_model=DeviceIdentityResponse, dependencies=[Depends(require_bearer)])
+    def get_device_identity_endpoint(username: str) -> dict[str, Any]:
+        """Return the device identity and pairing info for a running container.
+
+        Intended to be called by Maestro immediately after successful provisioning
+        so it can populate its `openclaw_instances` table (deviceId, operatorToken,
+        device keypair) and unlock WebSocket-based chat without a manual SSH step.
+
+        Returns 404 if the container does not exist, 409 if identity files have
+        not yet been written (container still initializing — caller should retry).
+        The response body contains secrets; do not log it.
+        """
+        return get_device_identity_service(username=username)
 
     @app.put("/v1/users/{username}/files", response_model=WriteFileResponse, dependencies=[Depends(require_bearer)])
     def write_file_endpoint(username: str, request: WriteFileRequest) -> dict[str, Any]:
