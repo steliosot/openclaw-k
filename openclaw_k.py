@@ -631,6 +631,21 @@ def seed_openclaw_state(
             config_content = with_openai_api_key(config_file_path.read_bytes())
             put_file_into_container(seed, "/home/node/.openclaw", "openclaw.json", config_content)
         if skills_dir_path:
+            # Docker's first-mount content-preservation copies the openclaw
+            # image's built-in /app/skills/ (~50 general-purpose skills —
+            # 1password, apple-notes, slack, taskflow, weather, etc.) into
+            # the freshly-created named volume before the bind takes effect.
+            # Those skills bloat the system prompt to 34k+ tokens and blow
+            # past OpenAI's per-model TPM limits. Wipe them so only our
+            # seed (just maestro-comfysql) ends up in the mounted volume.
+            wipe = seed.exec_run(["sh", "-lc", "rm -rf /app/skills/* /app/skills/.??*"], user="0:0")
+            if wipe.exit_code != 0:
+                print(
+                    f"[openclaw-k] warning: failed to wipe /app/skills before seed in "
+                    f"{user.container_name} (exit={wipe.exit_code}): "
+                    f"{(wipe.output or b'').decode('utf-8', errors='replace')[:200]}",
+                    flush=True,
+                )
             put_directory_into_container(seed, skills_dir_path, "/app/skills")
         if workspace_dir_path:
             put_directory_into_container(seed, workspace_dir_path, "/home/node/.openclaw/workspace")
