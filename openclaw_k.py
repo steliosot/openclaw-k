@@ -954,15 +954,22 @@ def create_user_service(
             )
         else:
             # comfysql is bind-mounted at /opt/comfysql (read-only) via
-            # volume_mounts above. Install from that path — no copy needed,
-            # no GitHub auth needed.
+            # volume_mounts above. pip needs to write `src/comfysql.egg-info`
+            # to the source directory during the wheel build, so we can't
+            # install directly from the read-only mount. Copy to /tmp
+            # (~400 KB without examples/output) and install from there.
             pip_result = container.exec_run(
                 [
                     "sh", "-lc",
+                    # Copy bind-mount to writable /tmp, exclude the heavy
+                    # `examples/` + `output/` dirs pip doesn't need.
+                    "cp -r /opt/comfysql /tmp/comfysql-src && "
+                    "rm -rf /tmp/comfysql-src/examples /tmp/comfysql-src/output && "
                     # --break-system-packages overrides PEP 668
                     # externally-managed marker on Debian's python.
                     "python3 -m pip install --user --break-system-packages --quiet "
-                    "/opt/comfysql && "
+                    "/tmp/comfysql-src && "
+                    "rm -rf /tmp/comfysql-src && "
                     "echo 'export PATH=$HOME/.local/bin:$PATH' >> /home/node/.bashrc",
                 ],
                 user="1000:1000",  # node user → pip --user lands in /home/node/.local/
