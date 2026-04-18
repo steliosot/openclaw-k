@@ -1015,9 +1015,23 @@ def create_user_service(
                     # but the plugin still fires as long as it exists.
                     "rm -f /home/node/.openclaw/workspace/HEARTBEAT.md",
                 ],
-                user="1000:1000",  # node user → pip --user lands in /home/node/.local/
+                user="1000:1000",
                 workdir="/home/node",
                 environment={"HOME": "/home/node"},
+            )
+            # Separately, as root, symlink the pip-installed comfysql/
+            # comfy-agent binaries into /usr/local/bin/ so they're on the
+            # default PATH. The agent's tool-calling shell is non-login
+            # and doesn't source .bashrc, so /home/node/.local/bin is not
+            # on PATH. Without the symlinks, agent reports "comfysql
+            # command not found" and hallucinates fake SQL instead.
+            container.exec_run(
+                [
+                    "sh", "-lc",
+                    "ln -sf /home/node/.local/bin/comfysql /usr/local/bin/comfysql && "
+                    "ln -sf /home/node/.local/bin/comfy-agent /usr/local/bin/comfy-agent"
+                ],
+                user="0:0",
             )
             if pip_result.exit_code != 0:
                 print(
