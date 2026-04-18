@@ -15,7 +15,7 @@ metadata:
               "id": "pip-comfysql",
               "kind": "script",
               "label": "Install comfysql from Maestro's fork",
-              "command": "pip install --user git+https://github.com/steliosot/comfysql.git@maestro-fixes",
+              "command": "pip install --user --break-system-packages /opt/comfysql",
               "bins": ["comfysql"]
             }
           ],

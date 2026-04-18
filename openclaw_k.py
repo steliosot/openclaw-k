@@ -940,26 +940,48 @@ def create_user_service(
                 flush=True,
             )
         else:
-            pip_result = container.exec_run(
-                [
-                    "sh", "-lc",
-                    # --break-system-packages overrides PEP 668 externally-
-                    # managed marker on Debian's python package.
-                    "python3 -m pip install --user --break-system-packages --quiet "
-                    "git+https://github.com/steliosot/comfysql.git@maestro-fixes && "
-                    "echo 'export PATH=$HOME/.local/bin:$PATH' >> /home/node/.bashrc",
-                ],
-                user="1000:1000",  # node user, so pip --user lands in /home/node/.local/
-                workdir="/home/node",
-                environment={"HOME": "/home/node"},
-            )
-            if pip_result.exit_code != 0:
+            # Install comfysql from a local clone on the VM (/opt/comfysql)
+            # rather than `pip install git+https://...` — the upstream repo
+            # (steliosot/comfysql) is private and containers have no GitHub
+            # credentials. The VM maintains /opt/comfysql via an
+            # authenticated clone (kept in sync by the operator). openclaw-k
+            # copies that source into the container and installs from the
+            # local path.
+            COMFYSQL_HOST_PATH = Path("/opt/comfysql")
+            if not COMFYSQL_HOST_PATH.is_dir():
                 print(
-                    f"[openclaw-k] warning: pip install comfysql failed in "
-                    f"{user.container_name} (exit={pip_result.exit_code}): "
-                    f"{(pip_result.output or b'').decode('utf-8', errors='replace')[:400]}",
+                    f"[openclaw-k] warning: /opt/comfysql not found on VM — "
+                    f"maestro-comfysql skill will not be usable in "
+                    f"{user.container_name} until an authenticated clone is staged",
                     flush=True,
                 )
+            else:
+                # Copy source into container under /tmp/comfysql-src (root-owned;
+                # fine since pip install only needs read access).
+                put_directory_into_container(
+                    container, COMFYSQL_HOST_PATH, "/tmp/comfysql-src",
+                )
+                pip_result = container.exec_run(
+                    [
+                        "sh", "-lc",
+                        # --break-system-packages overrides PEP 668
+                        # externally-managed marker on Debian's python.
+                        "python3 -m pip install --user --break-system-packages --quiet "
+                        "/tmp/comfysql-src && "
+                        "rm -rf /tmp/comfysql-src && "
+                        "echo 'export PATH=$HOME/.local/bin:$PATH' >> /home/node/.bashrc",
+                    ],
+                    user="1000:1000",  # node user → pip --user lands in /home/node/.local/
+                    workdir="/home/node",
+                    environment={"HOME": "/home/node"},
+                )
+                if pip_result.exit_code != 0:
+                    print(
+                        f"[openclaw-k] warning: pip install comfysql failed in "
+                        f"{user.container_name} (exit={pip_result.exit_code}): "
+                        f"{(pip_result.output or b'').decode('utf-8', errors='replace')[:400]}",
+                        flush=True,
+                    )
 
         container.restart()
         wait_until_ready(container, timeout_seconds=wait_timeout_seconds)
