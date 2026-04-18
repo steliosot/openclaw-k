@@ -1007,7 +1007,13 @@ def create_user_service(
                     # set up for our OpenAI config). Without disabling it,
                     # the agent picks `imagegen` over our `maestro-comfysql`
                     # skill for every image task and then dead-ends.
-                    "rm -rf /home/node/.codex/skills/.system/imagegen",
+                    "rm -rf /home/node/.codex/skills/.system/imagegen && "
+                    # Also nuke HEARTBEAT.md — openclaw recreates it on each
+                    # boot with a docstring telling the agent to reply
+                    # HEARTBEAT_OK periodically, which eats TPM budget fast.
+                    # The file's own docstring claims "keep empty to skip",
+                    # but the plugin still fires as long as it exists.
+                    "rm -f /home/node/.openclaw/workspace/HEARTBEAT.md",
                 ],
                 user="1000:1000",  # node user → pip --user lands in /home/node/.local/
                 workdir="/home/node",
