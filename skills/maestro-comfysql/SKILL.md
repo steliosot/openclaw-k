@@ -117,6 +117,29 @@ ls /home/node/.openclaw/workspace/generated/
 
 If the input image isn't yet on the ComfyUI server, the first run will error with an "invalid value" for the image field listing the allowed filenames. Use `comfysql copy-assets maestro` after putting the file under a writable `input/assets/` dir, or use the ComfyUI `/upload/image` endpoint directly.
 
+## End-to-end: virtual try-on with `fashn_vton`
+
+Given a person photo and a garment photo (either a flat-lay or a model wearing it):
+
+```bash
+# Stage both images into ComfyUI
+cd /home/node/comfysql && comfysql copy-assets maestro /tmp/person.png
+cd /home/node/comfysql && comfysql copy-assets maestro /tmp/garment.jpg
+
+# Run try-on. `category` is one of tops / bottoms / one-pieces.
+# `garment_photo_type` is flat-lay (product shot on white) or model (on another person).
+cd /home/node/comfysql && comfysql sql maestro -y \
+  --timeout 600 \
+  --download-output --download-dir /home/node/.openclaw/workspace/generated/ \
+  --sql "SELECT image FROM fashn_vton
+         WHERE \`1.image\`='person.png'
+           AND \`2.image\`='garment.jpg'
+           AND category='tops'
+           AND garment_photo_type='flat-lay';"
+```
+
+Model weights (`fashn-ai/fashn-vton-1.5`, `fashn-ai/DWPose`) download from Hugging Face on the first run — that first invocation will take several extra minutes, subsequent ones are cached.
+
 ## When NOT to use this skill
 
 - User wants text only → answer directly, no skill.
