@@ -974,11 +974,18 @@ def create_user_service(
                     # Set up a writable comfysql workdir at /home/node/comfysql:
                     #   - comfy-agent.json copied from the read-only mount
                     #   - input/ symlinked so it picks up workflow templates
-                    #   - .state/ exists for sql_schema_cache.json writes
+                    #   - .state/ populated with the workflow registry
+                    #     (copied from the mount so sql_schema_cache.json
+                    #     writes land in the writable copy, not the RO mount)
                     # The agent runs comfysql with this as CWD (see SKILL.md).
-                    "mkdir -p /home/node/comfysql/.state /home/node/comfysql/output && "
+                    "mkdir -p /home/node/comfysql/output && "
                     "cp /opt/comfysql/comfy-agent.json /home/node/comfysql/comfy-agent.json && "
-                    "ln -sf /opt/comfysql/input /home/node/comfysql/input",
+                    "ln -sf /opt/comfysql/input /home/node/comfysql/input && "
+                    "if [ -d /opt/comfysql/.state ]; then "
+                    "  cp -r /opt/comfysql/.state /home/node/comfysql/.state; "
+                    "else "
+                    "  mkdir -p /home/node/comfysql/.state; "
+                    "fi",
                 ],
                 user="1000:1000",  # node user → pip --user lands in /home/node/.local/
                 workdir="/home/node",
