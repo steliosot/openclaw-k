@@ -1,24 +1,14 @@
 ---
 name: maestro-comfysql
-description: "Generate and edit images via comfysql — a SQL-style client that drives a remote ComfyUI server. PRIMARY skill for Maestro's image pipeline. Use for any image generation, character staging, scene composition, camera adjustments, and expression control. Covers four curated Maestro workflows: qwen_image_edit (img-to-img, product-on-person, location swap), qwen_character_scene (close-ups with premium face/skin detail), qwen_next_scene (camera angle + framing changes for video sequences), expression_editor (facial expression retargeting without identity loss). Do NOT use for text-only answers, pure code tasks, or video rendering (not yet wired)."
+description: "Generate and edit images by writing small SQL queries against pre-built ComfyUI workflow templates. PRIMARY skill for Maestro's image pipeline. Use when the user wants to create, edit, composite, re-light, re-pose, or transform images — including putting a person in a new location, changing outfit, camera-angle changes for storyboard shots, expression adjustments, virtual try-on, color-matching between images. Do NOT use for text-only responses, video rendering (not wired up), or tasks that don't involve producing an image."
 homepage: https://github.com/steliosot/comfysql/tree/maestro-fixes
 metadata:
   {
     "openclaw":
       {
         "emoji": "🎬",
-        "os": ["linux", "darwin"],
-        "requires": { "bins": ["python3"] },
-        "install":
-          [
-            {
-              "id": "pip-comfysql",
-              "kind": "script",
-              "label": "Install comfysql from Maestro's fork",
-              "command": "pip install --user --break-system-packages /opt/comfysql",
-              "bins": ["comfysql"]
-            }
-          ],
+        "os": ["linux"],
+        "requires": { "bins": ["python3", "comfysql"] },
         "tags": ["image-generation", "image-edit", "comfyui", "comfysql", "qwen", "maestro"],
         "category": "media-generation",
         "priority": 100
@@ -28,195 +18,117 @@ metadata:
 
 # maestro-comfysql
 
-Drive Maestro's curated ComfyUI workflows through `comfysql` — a SQL-style CLI that compiles `SELECT image FROM <workflow> ... WHERE ...` into a ComfyUI prompt graph, submits it, and downloads the result.
+You do **not** write ComfyUI workflow JSON. You do **not** run Python scripts. Your only job is to pick a pre-built workflow template, write a one-line SQL query against it, and run `comfysql`.
 
-## What comfysql is
+## How it actually works
 
-`comfysql` is a thin Python client that wraps ComfyUI's HTTP + WebSocket API. It does **not** run the model itself — it sends workflow JSON to a remote ComfyUI server, streams progress over WebSocket, and downloads outputs. The ComfyUI server is elsewhere (configured via a server **alias**, not a raw URL).
+1. Maestro ships ~7 workflow templates at `/opt/comfysql/input/workflows/` — each is a JSON file that encodes a specific ComfyUI pipeline (image-to-image, character render, camera change, etc).
+2. You write a SQL statement like `SELECT image FROM qwen_image_edit WHERE prompt='…' AND input_image='…'`.
+3. `comfysql` takes that SQL, finds the matching template, substitutes your WHERE clause values into the right nodes of the template, and POSTs the resulting workflow JSON to the Maestro ComfyUI server.
+4. The server runs the workflow on GPU and returns an image.
 
-- Workflow catalog lives in the client (one JSON per workflow under `input/workflows/`).
-- Input assets (PNGs, JPEGs, reference images) are uploaded to the server before submission via `copy-assets` or referenced by filename if already present.
-- Outputs land in `./output/` by default; use `--download-output` on submit to pull images down locally.
+You never touch the workflow JSON. You just describe the user's intent in SQL WHERE clauses.
 
-## Setup (one-time per container)
+## Environment — always do this first
 
-**Required env var:**
-- `COMFY_SERVER` — server alias from `comfy-agent.json` (not a URL). For Maestro, this is `laptop` in dev or `prod` in production.
+Every invocation runs from `/opt/comfysql` so that `comfysql` auto-discovers the workflow templates and the `comfy-agent.json` server config:
 
-**Verify comfysql is available:**
 ```bash
-comfysql --version
-comfysql doctor "$COMFY_SERVER"
+cd /opt/comfysql
+export PATH="$HOME/.local/bin:$PATH"
 ```
 
-A healthy doctor output looks like:
-```
-doctor health=ok object_info=ok models=ok websocket=ok
-doctor_summary status=ok
-```
+Outputs should go to a writable dir (the bind-mount is read-only), so pass `--download-output --download-dir /home/node/.openclaw/workspace/generated/` on any query that should return a file.
 
-If `comfysql` isn't on PATH, install from Maestro's fork:
-```bash
-pip install git+https://github.com/steliosot/comfysql.git
-```
+**Server alias** is always `maestro` (points at the Maestro ComfyUI tunnel).
 
-**One-time sync** (pulls node/model catalog from the server; speeds up SQL compilation):
-```bash
-comfysql sync "$COMFY_SERVER"
-```
+## The seven workflow templates
 
-## The CLI — what you'll actually run
+| Template | What it does | Use when |
+|---|---|---|
+| `qwen_image_edit` | General image-to-image edit driven by a text instruction + one or more reference images | Default for editing an image. "Put this dress on her", "have him hold this object", "place her in this location", "add sunglasses". |
+| `qwen_character_scene` | Higher-fidelity character render (premium face/skin/lighting). Slower than qwen_image_edit. | Close-ups and hero shots where the face is the subject. Key art. |
+| `qwen_next_scene` | Take an existing shot, produce the same moment from a different camera (pull to full body, swing to side angle, reverse shot) | Video storyboarding. Given shot N, produce shot N+1 with a different framing but consistent subject. |
+| `expression_editor` | Change *only* the emotion on a face while preserving identity | Smile, frown, raised brows, closed eyes. Operates on a single face image; does not reframe. |
+| `color_match` | Color-grade one image to match the palette of a reference | Harmonizing composited elements, shot-to-shot continuity. |
+| `fashn_vton` | Virtual try-on — put a garment on a person | "How would this shirt look on the model?" Garment can be flat-lay or on another model. |
+| `txt2img_empty_latent` | Pure text-to-image, no reference | Concept art, abstract moodboards, anything where no input image is provided. |
 
-All commands accept the server alias positionally after the subcommand.
+**Pick rule of thumb:**
+- User provides an image of a subject + asks for something done to them → `qwen_image_edit`
+- Focus is tight on a face → `qwen_character_scene`
+- User wants a different camera on an existing shot → `qwen_next_scene`
+- User wants to change emotion/expression only → `expression_editor`
+- Pure try-on → `fashn_vton`
+- Just text, no inputs → `txt2img_empty_latent`
 
-| Command | Purpose |
-|---|---|
-| `comfysql doctor "$COMFY_SERVER"` | Health + auth + WebSocket check |
-| `comfysql sync "$COMFY_SERVER"` | Refresh node/model catalog cache |
-| `comfysql sql "$COMFY_SERVER" --sql "<SQL>;"` | Run a SQL statement (compile + submit + optionally download) |
-| `comfysql sql "$COMFY_SERVER" --sql "SHOW TABLES workflows;"` | List available workflows |
-| `comfysql sql "$COMFY_SERVER" --sql "DESCRIBE WORKFLOW qwen_image_edit;"` | Show a workflow's bindable fields |
-| `comfysql copy-assets "$COMFY_SERVER"` | Upload everything from `input/assets/` to the server |
-| `comfysql submit "$COMFY_SERVER" <workflow.json>` | Submit a raw workflow JSON (skip SQL layer) |
-| `comfysql validate <workflow.json>` | Static validation (no submit) |
-
-**Useful flags for `sql`:**
-- `--dry-run` — compile the SQL to API-prompt JSON without submitting. Great for debugging before burning a GPU run.
-- `--output-mode download` (or `--download-output`) — after successful submit, download the generated image to `./output/`.
-- `--upload-mode strict|warn|off` — how strictly to auto-upload referenced asset files before submit.
-- `-y` — skip confirmation prompts.
-- `--no-cache` — force a fresh run (randomizes seed).
-
-## SQL shape you'll use most
+## SQL shape
 
 ```sql
 SELECT image
 FROM <workflow_name>
-USING <preset_name>          -- optional; preset fills in defaults
-PROFILE <profile_name>       -- optional; cross-workflow style overrides
+USING <preset_name>         -- optional; `default_run` is always safe
 WHERE <field>=<value>
   AND <field>=<value>;
 ```
 
-- `<workflow_name>` — one of the four Maestro workflows below (or anything from `SHOW TABLES workflows;`).
-- `<preset_name>` — a saved parameter bundle; `default_run` is the safe default.
-- `WHERE` clauses — inputs the workflow expects (prompt text, image filenames, numeric knobs). Use `DESCRIBE WORKFLOW <name>;` to see exactly what a given workflow accepts.
+Always `SELECT image`. Always end with a semicolon. One statement per run.
 
-## Which workflow, when
+Quotes: single-quote strings. Double up single quotes inside a string (SQL-style escape).
 
-The four curated Maestro workflows — use them based on what the user is asking for.
+## Commands you will actually run
 
-### `qwen_image_edit` — the default for image-to-image
+```bash
+# Verify the tunnel is reachable (do once per session)
+cd /opt/comfysql && comfysql doctor maestro
 
-**Use when:** the user wants to modify or composite an image. "Put this dress on the person", "have her hold this product", "place him in this location", "add sunglasses", "swap the background". Takes one or more reference images and a text instruction.
+# See what fields a workflow accepts (before you write your WHERE clause)
+cd /opt/comfysql && comfysql sql maestro --sql "DESCRIBE WORKFLOW qwen_image_edit;"
 
-**Typical:**
-```sql
-SELECT image
-FROM qwen_image_edit
-USING default_run
-WHERE prompt='Put the green silk dress on the woman, studio lighting, realistic'
-  AND input_image='person.png'
-  AND reference_image='green_dress.png';
+# Dry-run: compile SQL to workflow JSON without submitting. Useful to catch
+# missing fields before burning GPU time.
+cd /opt/comfysql && comfysql sql maestro --dry-run --sql "SELECT image FROM qwen_image_edit WHERE prompt='…' AND input_image='person.png';"
+
+# Real run, downloads the output to a writable dir
+cd /opt/comfysql && comfysql sql maestro -y \
+  --download-output --download-dir /home/node/.openclaw/workspace/generated/ \
+  --sql "SELECT image FROM qwen_image_edit WHERE prompt='…' AND input_image='person.png';"
 ```
 
-### `qwen_character_scene` — higher-fidelity character renders
+## End-to-end: "put this man in front of the Eiffel Tower"
 
-**Use when:** you need premium face detail, skin texture, and lighting on a character — e.g. close-ups, hero shots, key art. Same kind of instruction as `qwen_image_edit` but slower and more polished for faces. Prefer this over `qwen_image_edit` when the user is pitching a scene that centers on a person's face.
+Given a photo the user uploaded to the workspace:
 
-**Typical:**
-```sql
-SELECT image
-FROM qwen_character_scene
-USING default_run
-WHERE prompt='Close-up portrait, side light, melancholic mood, 85mm'
-  AND character_image='hero.png';
+```bash
+# 1. Check what fields qwen_image_edit accepts
+cd /opt/comfysql && comfysql sql maestro --sql "DESCRIBE WORKFLOW qwen_image_edit;"
+
+# 2. Submit + download
+cd /opt/comfysql && comfysql sql maestro -y \
+  --download-output --download-dir /home/node/.openclaw/workspace/generated/ \
+  --sql "SELECT image
+         FROM qwen_image_edit
+         WHERE prompt='In front of the Eiffel Tower, Paris, overcast afternoon, 35mm, natural light, realistic skin'
+           AND input_image='ilker.png';"
+
+# 3. The resulting file is in /home/node/.openclaw/workspace/generated/
+ls /home/node/.openclaw/workspace/generated/
 ```
 
-### `qwen_next_scene` — camera and framing changes for sequences
-
-**Use when:** the user has an existing shot and wants a *different camera* on the same moment — pull to full body, go wide, swing to a side angle, reverse shot. Purpose-built for video storyboarding: given shot N, produce shot N+1 with a different framing but consistent subject.
-
-**Typical:**
-```sql
-SELECT image
-FROM qwen_next_scene
-USING default_run
-WHERE prompt='Pull back to full body, three-quarter angle from the left'
-  AND input_image='shot_01.png';
-```
-
-### `expression_editor` — facial expression control
-
-**Use when:** the user wants to change *only* the emotion/expression on a face while preserving identity — a smile, a frown, raised brows, closed eyes. Operates on a single face image; does not reframe or re-render the scene.
-
-**Typical:**
-```sql
-SELECT image
-FROM expression_editor
-USING default_run
-WHERE input_image='portrait.png'
-  AND smile=0.7
-  AND eye_opening=0.4
-  AND eyebrow_raise=0.3;
-```
-
-*(Exact knob names vary — always `DESCRIBE WORKFLOW expression_editor;` to see the current field list.)*
-
-## End-to-end example
-
-User asks: *"Take the picture of Ilker I uploaded, put him in the Paris café wearing the leather jacket."*
-
-1. **Confirm assets** are on the server:
-   ```bash
-   comfysql copy-assets "$COMFY_SERVER"   # uploads anything new from input/assets/
-   ```
-
-2. **Dry-run to sanity-check** compilation:
-   ```bash
-   comfysql sql "$COMFY_SERVER" --dry-run --sql "
-     SELECT image
-     FROM qwen_image_edit
-     USING default_run
-     WHERE prompt='Put Ilker in a Paris café, golden hour, wearing the leather jacket'
-       AND input_image='ilker.png'
-       AND reference_image='leather_jacket.png'
-       AND location_image='paris_cafe.jpg';"
-   ```
-
-3. **Submit and download**:
-   ```bash
-   comfysql sql "$COMFY_SERVER" -y --download-output --sql "
-     SELECT image
-     FROM qwen_image_edit
-     USING default_run
-     WHERE prompt='Put Ilker in a Paris café, golden hour, wearing the leather jacket'
-       AND input_image='ilker.png'
-       AND reference_image='leather_jacket.png'
-       AND location_image='paris_cafe.jpg';"
-   ```
-
-4. **Result** is in `./output/` with the prompt ID in the filename. Hand it back to the user.
+If the input image isn't yet on the ComfyUI server, the first run will error with an "invalid value" for the image field listing the allowed filenames. Use `comfysql copy-assets maestro` after putting the file under a writable `input/assets/` dir, or use the ComfyUI `/upload/image` endpoint directly.
 
 ## When NOT to use this skill
 
-- User wants **pure text generation** (use the main chat model).
-- User wants **video rendering** (Wan workflows are installed on the server but not wrapped here yet).
-- User wants **raw ComfyUI workflow authoring** (use `comfysql submit` with a hand-crafted JSON, or point them at the ComfyUI web UI).
-- The image involves **identities or subjects the user hasn't explicitly approved** (Maestro policy — always confirm before generating a recognizable person).
+- User wants text only → answer directly, no skill.
+- User wants video → not wired up yet. Say so.
+- User wants a workflow that isn't in the table above → say which workflows exist, let them pick.
+- You can't generate workflow JSON from scratch. If the user asks for something none of the templates cover, explain that.
 
 ## Troubleshooting
 
-- `doctor health=fail` → server alias wrong, or the tunnel/ComfyUI is down. Check `$COMFY_SERVER` and try the URL from `comfy-agent.json` directly.
-- `HTTP 403 Forbidden` on `/object_info` or `/models` → upstream Cloudflare bot rules. The Maestro-vendored comfysql sets a passing User-Agent; verify you're using that build.
-- `validation_failed missing_models` → the workflow references a checkpoint/LoRA/VAE not installed on this server. Pick a different workflow or ask the human.
-- `validation_failed unknown class_type` → custom node not installed on the server. Same — pick another workflow.
-- Workflow submits but hangs forever → WebSocket not reachable; check `doctor websocket`.
-- Want to see the compiled prompt before submission → add `--dry-run`.
-
-## What the output looks like
-
-`comfysql sql ... -y --download-output` writes:
-- `./output/<timestamp>/<workflow>_<seed>.png` — the generated image(s)
-- `./.state/sql_runs/run_<ts>/statement_<n>_api_prompt.json` — the compiled ComfyUI prompt (useful for debugging)
-- stdout: `validated nodes=N edges=N ... api_prompt: <path>` on success
+- `doctor health=fail` → tunnel down. Ask the user / surface to a human.
+- `HTTP 403` → Cloudflare bot rules caught the UA. Should be patched in this build; if it comes back, `COMFYSQL_USER_AGENT` env var overrides.
+- `validation_failed missing_models` → the ComfyUI server is missing a checkpoint/LoRA that the workflow references. Not fixable from inside the container; say so.
+- `validation_failed unknown class_type` → custom node missing on the server. Same — not fixable here.
+- Submits then hangs → WebSocket not reachable. `doctor websocket=ok` should confirm.
+- Want to see what SQL compiles to before burning GPU time → add `--dry-run`.
