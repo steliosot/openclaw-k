@@ -95,27 +95,54 @@ cd /home/node/comfysql && comfysql sql maestro -y \
   --sql "SELECT image FROM qwen_image_edit WHERE prompt='…' AND input_image='person.png';"
 ```
 
-## End-to-end: "put this man in front of the Eiffel Tower"
+## qwen_image_edit is a THREE-IMAGE compositor
 
-Given a photo the user uploaded to the workspace:
+`qwen_image_edit` takes three image inputs:
+
+- `4.image` — main subject (character / person)
+- `30.image` — outfit / secondary reference
+- `31.image` — product / tertiary reference
+
+The prompt (`5.prompt`) references them as "image1" (subject), "image2" (outfit), "image3" (product). The workflow is optimized for compositing a character into a new look/scene with outfit + product refs.
+
+**If the user only gave you ONE image** ("put this man in front of the Eiffel Tower"), pass the same file into all three slots. The model tolerates duplicate refs gracefully.
+
+### End-to-end: "put this man in front of the Eiffel Tower" (single subject)
 
 ```bash
-# 1. Check what fields qwen_image_edit accepts
-cd /home/node/comfysql && comfysql sql maestro --sql "DESCRIBE WORKFLOW qwen_image_edit;"
+# Stage the user's image
+cd /home/node/comfysql && comfysql copy-assets maestro /tmp/subject.jpg
 
-# 2. Submit + download
+# Run — pass subject.jpg into all three image slots when you don't have
+# dedicated outfit / product references.
 cd /home/node/comfysql && comfysql sql maestro -y \
+  --timeout 600 \
   --download-output --download-dir /home/node/.openclaw/workspace/generated/ \
-  --sql "SELECT image
-         FROM qwen_image_edit
-         WHERE prompt='In front of the Eiffel Tower, Paris, overcast afternoon, 35mm, natural light, realistic skin'
-           AND input_image='ilker.png';"
-
-# 3. The resulting file is in /home/node/.openclaw/workspace/generated/
-ls /home/node/.openclaw/workspace/generated/
+  --sql "SELECT image FROM qwen_image_edit
+         WHERE \`4.image\`='subject.jpg'
+           AND \`30.image\`='subject.jpg'
+           AND \`31.image\`='subject.jpg'
+           AND \`5.prompt\`='In front of the Eiffel Tower, Paris, overcast afternoon, 35mm, natural light, realistic skin. Keep the person from image1.';"
 ```
 
-If the input image isn't yet on the ComfyUI server, the first run will error with an "invalid value" for the image field listing the allowed filenames. Use `comfysql copy-assets maestro` after putting the file under a writable `input/assets/` dir, or use the ComfyUI `/upload/image` endpoint directly.
+### End-to-end: full 3-image composite
+
+```bash
+cd /home/node/comfysql && comfysql copy-assets maestro /tmp/person.png
+cd /home/node/comfysql && comfysql copy-assets maestro /tmp/outfit.jpg
+cd /home/node/comfysql && comfysql copy-assets maestro /tmp/bag.jpg
+
+cd /home/node/comfysql && comfysql sql maestro -y \
+  --timeout 600 \
+  --download-output --download-dir /home/node/.openclaw/workspace/generated/ \
+  --sql "SELECT image FROM qwen_image_edit
+         WHERE \`4.image\`='person.png'
+           AND \`30.image\`='outfit.jpg'
+           AND \`31.image\`='bag.jpg'
+           AND \`5.prompt\`='Keep the character from image1. She is wearing the outfit from image2 and carrying the bag from image3. Walking a wide Paris boulevard at golden hour, cinematic.';"
+```
+
+If any image isn't on the ComfyUI server, the run errors with an "invalid value" for that field listing the allowed filenames. Use `comfysql copy-assets maestro` to stage it.
 
 ## End-to-end: virtual try-on with `fashn_vton`
 
