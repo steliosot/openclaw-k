@@ -918,35 +918,48 @@ def create_user_service(
         # regardless, and device auth is desirable anyway for the WebSocket flow.
         safe_set_config(container, "gateway.controlUi.dangerouslyDisableDeviceAuth", "true", optional=True)
 
-        # Install Maestro-required tooling in the container. The openclaw image
-        # ships python3 and git but no pip, and no comfysql (the client our
-        # maestro-comfysql skill needs to talk to the remote ComfyUI server).
-        # Do it once here so new users don't have to wait / do it manually on
-        # first skill invocation.
-        install_result = container.exec_run(
+        # Install Maestro-required tooling in the container. The openclaw
+        # image ships python3 and git but no pip, no sudo, and no comfysql
+        # (the client our maestro-comfysql skill needs to talk to ComfyUI).
+        # Do it once here so new users don't have to wait / install manually.
+        #
+        # Two separate exec_run calls because `sudo` isn't available in the
+        # container — we can't drop from root to node inside a single shell.
+        apt_result = container.exec_run(
             [
                 "sh", "-lc",
-                # apt-get as root for python3-pip, then pip install comfysql as node.
-                # --break-system-packages allows pip into /home/node/.local even when
-                # the system Python is marked externally-managed (PEP 668).
-                "apt-get update -qq && "
-                "apt-get install -y -qq python3-pip >/dev/null 2>&1 && "
-                "sudo -u node python3 -m pip install --user --break-system-packages --quiet "
-                "git+https://github.com/zehra-rgb/comfysql.git && "
-                "echo 'export PATH=$HOME/.local/bin:$PATH' >> /home/node/.bashrc && "
-                "echo installed"
+                "apt-get update -qq && apt-get install -y -qq python3-pip",
             ],
             user="0:0",
         )
-        if install_result.exit_code != 0:
-            # Don't fail the whole provision — maestro-comfysql just won't be
-            # usable until someone installs it manually. Log and continue.
+        if apt_result.exit_code != 0:
             print(
-                f"[openclaw-k] warning: failed to install comfysql in {user.container_name} "
-                f"(exit={install_result.exit_code}): "
-                f"{(install_result.output or b'').decode('utf-8', errors='replace')[:500]}",
+                f"[openclaw-k] warning: apt-get python3-pip failed in "
+                f"{user.container_name} (exit={apt_result.exit_code}): "
+                f"{(apt_result.output or b'').decode('utf-8', errors='replace')[:400]}",
                 flush=True,
             )
+        else:
+            pip_result = container.exec_run(
+                [
+                    "sh", "-lc",
+                    # --break-system-packages overrides PEP 668 externally-
+                    # managed marker on Debian's python package.
+                    "python3 -m pip install --user --break-system-packages --quiet "
+                    "git+https://github.com/zehra-rgb/comfysql.git && "
+                    "echo 'export PATH=$HOME/.local/bin:$PATH' >> /home/node/.bashrc",
+                ],
+                user="1000:1000",  # node user, so pip --user lands in /home/node/.local/
+                workdir="/home/node",
+                environment={"HOME": "/home/node"},
+            )
+            if pip_result.exit_code != 0:
+                print(
+                    f"[openclaw-k] warning: pip install comfysql failed in "
+                    f"{user.container_name} (exit={pip_result.exit_code}): "
+                    f"{(pip_result.output or b'').decode('utf-8', errors='replace')[:400]}",
+                    flush=True,
+                )
 
         container.restart()
         wait_until_ready(container, timeout_seconds=wait_timeout_seconds)
