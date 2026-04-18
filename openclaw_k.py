@@ -20,7 +20,7 @@ import urllib.parse
 import docker
 from docker.errors import APIError, DockerException, NotFound
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field, ConfigDict, field_validator
 import yaml
@@ -1614,6 +1614,55 @@ def create_api_app(admin_token: str) -> FastAPI:
         The response body contains secrets; do not log it.
         """
         return get_device_identity_service(username=username)
+
+    @app.get("/v1/users/{username}/files/{path:path}", dependencies=[Depends(require_bearer)])
+    def read_file_endpoint(username: str, path: str) -> StreamingResponse:
+        """Stream the contents of a workspace file back to the caller.
+
+        Used by Maestro to pull generated images / artifacts out of a
+        container and display them inline in the web UI. Path is
+        evaluated relative to the container's workspace root
+        (/home/node/.openclaw/workspace) and traversal outside that
+        root is rejected.
+        """
+        import mimetypes
+        import posixpath
+
+        user = UserContainer(username)
+        try:
+            container = docker.from_env().containers.get(user.container_name)
+        except NotFound:
+            raise ServiceError(404, "user_not_found", f"User '{username}' not found.")
+
+        workspace_base = "/home/node/.openclaw/workspace"
+        # Collapse any ../ traversal attempts.
+        normalized = posixpath.normpath("/" + path).lstrip("/")
+        if normalized.startswith("..") or normalized == "":
+            raise ServiceError(400, "invalid_path", "Path must be relative and inside the workspace.")
+        src_path = posixpath.join(workspace_base, normalized)
+
+        # Check existence + get size via stat; `test -e` short-circuits on missing files.
+        check = container.exec_run(["test", "-f", src_path])
+        if check.exit_code != 0:
+            raise ServiceError(404, "file_not_found", f"File not found: {normalized}")
+
+        # Stream the file bytes out via `cat`. For small files this is
+        # fine; large images (>50 MB) might want a multi-chunk path but
+        # Qwen Image Edit outputs are typically ~1-4 MB.
+        result = container.exec_run(["cat", src_path], demux=False)
+        if result.exit_code != 0:
+            raise ServiceError(500, "read_failed", f"Failed to read {normalized}")
+
+        mime, _ = mimetypes.guess_type(normalized)
+        headers = {"Cache-Control": "private, max-age=300"}
+        filename = posixpath.basename(normalized)
+        headers["Content-Disposition"] = f'inline; filename="{filename}"'
+
+        return StreamingResponse(
+            iter([result.output or b""]),
+            media_type=mime or "application/octet-stream",
+            headers=headers,
+        )
 
     @app.put("/v1/users/{username}/files", response_model=WriteFileResponse, dependencies=[Depends(require_bearer)])
     def write_file_endpoint(username: str, request: WriteFileRequest) -> dict[str, Any]:
