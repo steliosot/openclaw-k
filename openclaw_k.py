@@ -985,7 +985,14 @@ def create_user_service(
                     "  cp -r /opt/comfysql/.state /home/node/comfysql/.state; "
                     "else "
                     "  mkdir -p /home/node/comfysql/.state; "
-                    "fi",
+                    "fi && "
+                    # Disable the container image's built-in imagegen system
+                    # skill. It tells the agent to use Codex's `image_gen`
+                    # built-in tool (which requires an ACP agent that isn't
+                    # set up for our OpenAI config). Without disabling it,
+                    # the agent picks `imagegen` over our `maestro-comfysql`
+                    # skill for every image task and then dead-ends.
+                    "rm -rf /home/node/.codex/skills/.system/imagegen",
                 ],
                 user="1000:1000",  # node user → pip --user lands in /home/node/.local/
                 workdir="/home/node",
