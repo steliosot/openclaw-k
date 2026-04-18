@@ -631,7 +631,7 @@ def seed_openclaw_state(
             config_content = with_openai_api_key(config_file_path.read_bytes())
             put_file_into_container(seed, "/home/node/.openclaw", "openclaw.json", config_content)
         if skills_dir_path:
-            put_directory_into_container(seed, skills_dir_path, "/app/skills")
+            put_directory_into_container(seed, skills_dir_path, "/home/node/.codex/skills")
         if workspace_dir_path:
             put_directory_into_container(seed, workspace_dir_path, "/home/node/.openclaw/workspace")
         # Explicit soul_file overrides workspace_dir/SOUL.md if both are set.
@@ -642,7 +642,7 @@ def seed_openclaw_state(
             "if [ -f /home/node/.openclaw/openclaw.json ]; then chown 1000:1000 /home/node/.openclaw/openclaw.json && chmod 600 /home/node/.openclaw/openclaw.json; fi; "
             "if [ -f /home/node/.openclaw/workspace/SOUL.md ]; then chown 1000:1000 /home/node/.openclaw/workspace/SOUL.md && chmod 644 /home/node/.openclaw/workspace/SOUL.md; fi; "
             "if [ -d /home/node/.openclaw/workspace ]; then chown -R 1000:1000 /home/node/.openclaw/workspace; fi; "
-            "if [ -d /app/skills ]; then chown -R 1000:1000 /app/skills; fi"
+            "if [ -d /home/node/.codex/skills ]; then chown -R 1000:1000 /home/node/.codex/skills; fi"
         )
         chown_result = seed.exec_run(["sh", "-lc", chown_cmd])
         if chown_result.exit_code != 0:
@@ -894,7 +894,7 @@ def create_user_service(
         volume_mounts = {
             user.config_volume: {"bind": "/home/node/.openclaw", "mode": "rw"},
             user.workspace_volume: {"bind": "/home/node/.openclaw/workspace", "mode": "rw"},
-            user.skills_volume: {"bind": "/app/skills", "mode": "rw"},
+            user.skills_volume: {"bind": "/home/node/.codex/skills", "mode": "rw"},
         }
         skills_dir_path, soul_file_path, workspace_dir_path = resolve_optional_defaults()
         seed_openclaw_state(client, image, volume_mounts, config_file_path, skills_dir_path, soul_file_path, workspace_dir_path)
@@ -1024,10 +1024,10 @@ def delete_user_service(*, username: str, keep_data: bool = False) -> dict[str, 
 
 
 def _sync_skills_mirror(container: docker.models.containers.Container, skills_dir_path: Path) -> None:
-    wipe = container.exec_run(["sh", "-lc", "mkdir -p /app/skills && rm -rf /app/skills/*"], user="0:0")
+    wipe = container.exec_run(["sh", "-lc", "mkdir -p /home/node/.codex/skills && rm -rf /home/node/.codex/skills/*"], user="0:0")
     if wipe.exit_code != 0:
-        raise ServiceError(500, "skills_sync_failed", "Failed to clean /app/skills before sync.")
-    put_directory_into_container(container, skills_dir_path, "/app/skills")
+        raise ServiceError(500, "skills_sync_failed", "Failed to clean /home/node/.codex/skills before sync.")
+    put_directory_into_container(container, skills_dir_path, "/home/node/.codex/skills")
 
 
 def _sync_workspace_mirror(container: docker.models.containers.Container, workspace_dir_path: Path) -> None:
@@ -1103,7 +1103,7 @@ def update_all_service(
                 "if [ -f /home/node/.openclaw/openclaw.json ]; then chown 1000:1000 /home/node/.openclaw/openclaw.json && chmod 600 /home/node/.openclaw/openclaw.json; fi; "
                 "if [ -f /home/node/.openclaw/workspace/SOUL.md ]; then chown 1000:1000 /home/node/.openclaw/workspace/SOUL.md && chmod 644 /home/node/.openclaw/workspace/SOUL.md; fi; "
                 "if [ -d /home/node/.openclaw/workspace ]; then chown -R 1000:1000 /home/node/.openclaw/workspace; fi; "
-                "if [ -d /app/skills ]; then chown -R 1000:1000 /app/skills; fi"
+                "if [ -d /home/node/.codex/skills ]; then chown -R 1000:1000 /home/node/.codex/skills; fi"
             )
             chown_result = container.exec_run(["sh", "-lc", chown_cmd], user="0:0")
             if chown_result.exit_code != 0:
