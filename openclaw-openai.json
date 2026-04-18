@@ -11,9 +11,8 @@
         "apiKey": "REPLACE_WITH_ENV_OPENAI_API_KEY",
         "baseUrl": "https://api.openai.com/v1",
         "models": [
-          { "id": "codex-mini-latest", "name": "codex-mini-latest" },
-          { "id": "gpt-4o", "name": "gpt-4o" },
-          { "id": "gpt-4o-mini", "name": "gpt-4o-mini" }
+          { "id": "gpt-4o-mini", "name": "gpt-4o-mini" },
+          { "id": "gpt-4o", "name": "gpt-4o" }
         ]
       }
     }
@@ -21,7 +20,7 @@
   "agents": {
     "defaults": {
       "model": {
-        "primary": "openai/codex-mini-latest"
+        "primary": "openai/gpt-4o-mini"
       }
     }
   }
