@@ -917,6 +917,37 @@ def create_user_service(
         # Treat as best-effort — the container still boots and is healthy
         # regardless, and device auth is desirable anyway for the WebSocket flow.
         safe_set_config(container, "gateway.controlUi.dangerouslyDisableDeviceAuth", "true", optional=True)
+
+        # Install Maestro-required tooling in the container. The openclaw image
+        # ships python3 and git but no pip, and no comfysql (the client our
+        # maestro-comfysql skill needs to talk to the remote ComfyUI server).
+        # Do it once here so new users don't have to wait / do it manually on
+        # first skill invocation.
+        install_result = container.exec_run(
+            [
+                "sh", "-lc",
+                # apt-get as root for python3-pip, then pip install comfysql as node.
+                # --break-system-packages allows pip into /home/node/.local even when
+                # the system Python is marked externally-managed (PEP 668).
+                "apt-get update -qq && "
+                "apt-get install -y -qq python3-pip >/dev/null 2>&1 && "
+                "sudo -u node python3 -m pip install --user --break-system-packages --quiet "
+                "git+https://github.com/zehra-rgb/comfysql.git && "
+                "echo 'export PATH=$HOME/.local/bin:$PATH' >> /home/node/.bashrc && "
+                "echo installed"
+            ],
+            user="0:0",
+        )
+        if install_result.exit_code != 0:
+            # Don't fail the whole provision — maestro-comfysql just won't be
+            # usable until someone installs it manually. Log and continue.
+            print(
+                f"[openclaw-k] warning: failed to install comfysql in {user.container_name} "
+                f"(exit={install_result.exit_code}): "
+                f"{(install_result.output or b'').decode('utf-8', errors='replace')[:500]}",
+                flush=True,
+            )
+
         container.restart()
         wait_until_ready(container, timeout_seconds=wait_timeout_seconds)
         container.reload()
