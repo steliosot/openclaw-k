@@ -22,7 +22,7 @@ You do **not** write ComfyUI workflow JSON. You do **not** run Python scripts. Y
 
 ## How it actually works
 
-1. Maestro ships ~7 workflow templates at `/opt/comfysql/input/workflows/` — each is a JSON file that encodes a specific ComfyUI pipeline (image-to-image, character render, camera change, etc).
+1. Maestro ships ~7 workflow templates at `/home/node/comfysql/input/workflows/` (symlinked to read-only `/opt/comfysql/input/workflows/`) — each is a JSON file that encodes a specific ComfyUI pipeline (image-to-image, character render, camera change, etc).
 2. You write a SQL statement like `SELECT image FROM qwen_image_edit WHERE prompt='…' AND input_image='…'`.
 3. `comfysql` takes that SQL, finds the matching template, substitutes your WHERE clause values into the right nodes of the template, and POSTs the resulting workflow JSON to the Maestro ComfyUI server.
 4. The server runs the workflow on GPU and returns an image.
@@ -31,10 +31,10 @@ You never touch the workflow JSON. You just describe the user's intent in SQL WH
 
 ## Environment — always do this first
 
-Every invocation runs from `/opt/comfysql` so that `comfysql` auto-discovers the workflow templates and the `comfy-agent.json` server config:
+Every invocation runs from `/home/node/comfysql` (writable workdir, pre-wired at container creation) so that `comfysql` auto-discovers the workflow templates and the `comfy-agent.json` server config:
 
 ```bash
-cd /opt/comfysql
+cd /home/node/comfysql
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
@@ -80,17 +80,17 @@ Quotes: single-quote strings. Double up single quotes inside a string (SQL-style
 
 ```bash
 # Verify the tunnel is reachable (do once per session)
-cd /opt/comfysql && comfysql doctor maestro
+cd /home/node/comfysql && comfysql doctor maestro
 
 # See what fields a workflow accepts (before you write your WHERE clause)
-cd /opt/comfysql && comfysql sql maestro --sql "DESCRIBE WORKFLOW qwen_image_edit;"
+cd /home/node/comfysql && comfysql sql maestro --sql "DESCRIBE WORKFLOW qwen_image_edit;"
 
 # Dry-run: compile SQL to workflow JSON without submitting. Useful to catch
 # missing fields before burning GPU time.
-cd /opt/comfysql && comfysql sql maestro --dry-run --sql "SELECT image FROM qwen_image_edit WHERE prompt='…' AND input_image='person.png';"
+cd /home/node/comfysql && comfysql sql maestro --dry-run --sql "SELECT image FROM qwen_image_edit WHERE prompt='…' AND input_image='person.png';"
 
 # Real run, downloads the output to a writable dir
-cd /opt/comfysql && comfysql sql maestro -y \
+cd /home/node/comfysql && comfysql sql maestro -y \
   --download-output --download-dir /home/node/.openclaw/workspace/generated/ \
   --sql "SELECT image FROM qwen_image_edit WHERE prompt='…' AND input_image='person.png';"
 ```
@@ -101,10 +101,10 @@ Given a photo the user uploaded to the workspace:
 
 ```bash
 # 1. Check what fields qwen_image_edit accepts
-cd /opt/comfysql && comfysql sql maestro --sql "DESCRIBE WORKFLOW qwen_image_edit;"
+cd /home/node/comfysql && comfysql sql maestro --sql "DESCRIBE WORKFLOW qwen_image_edit;"
 
 # 2. Submit + download
-cd /opt/comfysql && comfysql sql maestro -y \
+cd /home/node/comfysql && comfysql sql maestro -y \
   --download-output --download-dir /home/node/.openclaw/workspace/generated/ \
   --sql "SELECT image
          FROM qwen_image_edit

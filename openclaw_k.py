@@ -970,7 +970,15 @@ def create_user_service(
                     "python3 -m pip install --user --break-system-packages --quiet "
                     "/tmp/comfysql-src && "
                     "rm -rf /tmp/comfysql-src && "
-                    "echo 'export PATH=$HOME/.local/bin:$PATH' >> /home/node/.bashrc",
+                    "echo 'export PATH=$HOME/.local/bin:$PATH' >> /home/node/.bashrc && "
+                    # Set up a writable comfysql workdir at /home/node/comfysql:
+                    #   - comfy-agent.json copied from the read-only mount
+                    #   - input/ symlinked so it picks up workflow templates
+                    #   - .state/ exists for sql_schema_cache.json writes
+                    # The agent runs comfysql with this as CWD (see SKILL.md).
+                    "mkdir -p /home/node/comfysql/.state /home/node/comfysql/output && "
+                    "cp /opt/comfysql/comfy-agent.json /home/node/comfysql/comfy-agent.json && "
+                    "ln -sf /opt/comfysql/input /home/node/comfysql/input",
                 ],
                 user="1000:1000",  # node user → pip --user lands in /home/node/.local/
                 workdir="/home/node",
