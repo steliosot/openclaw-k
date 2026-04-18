@@ -946,7 +946,7 @@ def create_user_service(
                     # --break-system-packages overrides PEP 668 externally-
                     # managed marker on Debian's python package.
                     "python3 -m pip install --user --break-system-packages --quiet "
-                    "git+https://github.com/zehra-rgb/comfysql.git && "
+                    "git+https://github.com/steliosot/comfysql.git@maestro-fixes && "
                     "echo 'export PATH=$HOME/.local/bin:$PATH' >> /home/node/.bashrc",
                 ],
                 user="1000:1000",  # node user, so pip --user lands in /home/node/.local/

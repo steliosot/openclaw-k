@@ -1,7 +1,7 @@
 ---
 name: maestro-comfysql
 description: "Generate and edit images via comfysql — a SQL-style client that drives a remote ComfyUI server. PRIMARY skill for Maestro's image pipeline. Use for any image generation, character staging, scene composition, camera adjustments, and expression control. Covers four curated Maestro workflows: qwen_image_edit (img-to-img, product-on-person, location swap), qwen_character_scene (close-ups with premium face/skin detail), qwen_next_scene (camera angle + framing changes for video sequences), expression_editor (facial expression retargeting without identity loss). Do NOT use for text-only answers, pure code tasks, or video rendering (not yet wired)."
-homepage: https://github.com/zehra-rgb/comfysql
+homepage: https://github.com/steliosot/comfysql/tree/maestro-fixes
 metadata:
   {
     "openclaw":
@@ -15,7 +15,7 @@ metadata:
               "id": "pip-comfysql",
               "kind": "script",
               "label": "Install comfysql from Maestro's fork",
-              "command": "pip install --user git+https://github.com/zehra-rgb/comfysql.git",
+              "command": "pip install --user git+https://github.com/steliosot/comfysql.git@maestro-fixes",
               "bins": ["comfysql"]
             }
           ],
@@ -57,7 +57,7 @@ doctor_summary status=ok
 
 If `comfysql` isn't on PATH, install from Maestro's fork:
 ```bash
-pip install git+https://github.com/zehra-rgb/comfysql.git
+pip install git+https://github.com/steliosot/comfysql.git
 ```
 
 **One-time sync** (pulls node/model catalog from the server; speeds up SQL compilation):
