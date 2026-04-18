@@ -532,7 +532,7 @@ def put_file_into_container(container: docker.models.containers.Container, dest_
         raise ServiceError(500, "container_copy_failed", f"Could not copy '{name}' into container at '{dest_dir}'.")
 
 
-def with_openai_api_key(config_bytes: bytes) -> bytes:
+def inject_provider_api_keys(config_bytes: bytes) -> bytes:
     """Inject OPENAI_API_KEY and ANTHROPIC_API_KEY env values into the
     matching provider entries in the openclaw config JSON.
 
@@ -635,7 +635,7 @@ def seed_openclaw_state(
     try:
         seed.start()
         if config_file_path:
-            config_content = with_openai_api_key(config_file_path.read_bytes())
+            config_content = inject_provider_api_keys(config_file_path.read_bytes())
             put_file_into_container(seed, "/home/node/.openclaw", "openclaw.json", config_content)
         if skills_dir_path:
             # Docker's first-mount content-preservation copies the openclaw
@@ -1214,7 +1214,7 @@ def update_all_service(
         }
         try:
             if config_file_path:
-                config_content = with_openai_api_key(config_file_path.read_bytes())
+                config_content = inject_provider_api_keys(config_file_path.read_bytes())
                 put_file_into_container(container, "/home/node/.openclaw", "openclaw.json", config_content)
                 item["applied"]["config"] = True
 
