@@ -807,13 +807,21 @@ def get_device_identity_service(username: str) -> dict[str, Any]:
         )
 
     flat: dict[str, Any] = {}
+    # Field-name variants observed in the wild: openclaw's identity/device.json
+    # uses camelCase with the `Pem` suffix for keys (`privateKeyPem`,
+    # `publicKeyPem`). Include those explicitly. `operatorToken` may not be
+    # present at all when the container is configured with
+    # `gateway.controlUi.dangerouslyDisableDeviceAuth=true` (simple auth mode,
+    # no pairing) — that's fine; the caller treats it as optional.
     interesting_fields = (
         "deviceId", "device_id",
         "operatorToken", "operator_token",
         "privateKey", "private_key",
         "devicePrivateKey", "device_private_key",
+        "privateKeyPem", "private_key_pem",
         "publicKey", "public_key",
         "devicePublicKey", "device_public_key",
+        "publicKeyPem", "public_key_pem",
     )
     for doc in collected.values():
         if not isinstance(doc, dict):
