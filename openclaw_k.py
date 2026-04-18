@@ -927,13 +927,26 @@ def create_user_service(
         skills_dir_path, soul_file_path, workspace_dir_path = resolve_optional_defaults()
         seed_openclaw_state(client, image, volume_mounts, config_file_path, skills_dir_path, soul_file_path, workspace_dir_path)
 
+        # Maestro-side callback wiring: the agent runs `maestro-state ...`
+        # inside the container, which POSTs to Maestro's API to push
+        # Production Desk / sidebar / image updates. We pass the
+        # Maestro API base URL + the container's gateway token (same
+        # one Maestro stores in openclaw_instances.auth_token_hash);
+        # Maestro maps token → user on the callback side.
+        maestro_api_base = os.environ.get("MAESTRO_API_URL", "")
+        container_env = {
+            "OPENCLAW_GATEWAY_TOKEN": token,
+            "MAESTRO_CALLBACK_URL": f"{maestro_api_base.rstrip('/')}/api/agent-callback/state" if maestro_api_base else "",
+            "MAESTRO_CALLBACK_TOKEN": token,
+        }
+
         container = client.containers.run(
             image,
             name=user.container_name,
             detach=True,
             restart_policy={"Name": "unless-stopped"},
             ports={f"{OPENCLAW_INTERNAL_PORT}/tcp": (publish_bind_ip, port)},
-            environment={"OPENCLAW_GATEWAY_TOKEN": token},
+            environment=container_env,
             command=["node", "openclaw.mjs", "gateway", "--allow-unconfigured", "--bind", "lan"],
             labels={"app": "openclaw", "managed-by": "openclaw-k", "openclaw-k.user": username},
             volumes=volume_mounts,
@@ -1040,6 +1053,89 @@ def create_user_service(
                 ],
                 user="0:0",
             )
+
+            # Install the Maestro-state bash helper so the agent can push
+            # Production Desk / image updates back to Maestro without
+            # needing to run raw curl. Usage examples:
+            #   maestro-state --project $PROJECT_ID --title "Giza shot"
+            #   maestro-state --project $PROJECT_ID --stage image \\
+            #                 --image-path generated/giza_01.png
+            #   maestro-state --project $PROJECT_ID --message "image ready"
+            #
+            # Reads MAESTRO_CALLBACK_URL and MAESTRO_CALLBACK_TOKEN from
+            # env (set by the container.run call above). Writes nothing
+            # if either is missing so local/dev containers don't break.
+            maestro_state_script = r'''#!/bin/bash
+# Push a Production Desk / artifact update from the agent back to
+# Maestro. Meant to be called inline from the agent's bash tool.
+set -e
+URL="${MAESTRO_CALLBACK_URL:-}"
+TOKEN="${MAESTRO_CALLBACK_TOKEN:-}"
+if [ -z "$URL" ] || [ -z "$TOKEN" ]; then
+  echo "[maestro-state] callback env not configured; skipping" >&2
+  exit 0
+fi
+
+PROJECT=""
+TITLE=""
+STAGE=""
+STAGE_UPDATE=""
+STAGE_COMPLETE=""
+IMAGE_PATH=""
+MESSAGE=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --project) PROJECT="$2"; shift 2;;
+    --title) TITLE="$2"; shift 2;;
+    --stage) STAGE="$2"; shift 2;;
+    --stage-update) STAGE_UPDATE="$2"; shift 2;;
+    --stage-complete) STAGE_COMPLETE="true"; shift;;
+    --image-path) IMAGE_PATH="$2"; shift 2;;
+    --message) MESSAGE="$2"; shift 2;;
+    *) echo "[maestro-state] unknown flag: $1" >&2; exit 2;;
+  esac
+done
+
+if [ -z "$PROJECT" ]; then
+  echo "[maestro-state] --project is required" >&2
+  exit 2
+fi
+
+# Build JSON with python for safe escaping. Fields omitted when empty.
+BODY=$(python3 -c '
+import json, sys
+fields = {
+  "projectId": sys.argv[1],
+  "title":     sys.argv[2] or None,
+  "stage":     sys.argv[3] or None,
+  "stageUpdate": (json.loads(sys.argv[4]) if sys.argv[4] else None),
+  "stageComplete": (True if sys.argv[5] == "true" else None),
+  "imagePath": sys.argv[6] or None,
+  "message":   sys.argv[7] or None,
+}
+print(json.dumps({k: v for k, v in fields.items() if v is not None}))
+' "$PROJECT" "$TITLE" "$STAGE" "$STAGE_UPDATE" "$STAGE_COMPLETE" "$IMAGE_PATH" "$MESSAGE")
+
+curl -sS -X POST \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "$BODY" \
+  "$URL" >/dev/null 2>&1 || {
+    echo "[maestro-state] callback failed" >&2
+    exit 1
+  }
+echo "[maestro-state] pushed: $BODY"
+'''
+            # Write the script and mark executable.
+            put_file_into_container(
+                container, "/usr/local/bin", "maestro-state", maestro_state_script.encode("utf-8")
+            )
+            container.exec_run(
+                ["sh", "-lc", "chmod +x /usr/local/bin/maestro-state"],
+                user="0:0",
+            )
+
             if pip_result.exit_code != 0:
                 print(
                     f"[openclaw-k] warning: pip install comfysql failed in "
