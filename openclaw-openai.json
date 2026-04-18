@@ -24,8 +24,5 @@
         "primary": "openai/codex-mini-latest"
       }
     }
-  },
-  "heartbeat": {
-    "enabled": false
   }
 }
