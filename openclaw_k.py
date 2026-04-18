@@ -533,9 +533,15 @@ def put_file_into_container(container: docker.models.containers.Container, dest_
 
 
 def with_openai_api_key(config_bytes: bytes) -> bytes:
-    api_key = os.getenv(OPENAI_API_KEY_ENV)
-    if not api_key:
-        return config_bytes
+    """Inject OPENAI_API_KEY and ANTHROPIC_API_KEY env values into the
+    matching provider entries in the openclaw config JSON.
+
+    Despite the historical function name, this also handles Anthropic:
+    if ANTHROPIC_API_KEY is set and the config has a `models.providers.
+    anthropic` entry, its `apiKey` is populated from the env value.
+    Each substitution is independent — either, both, or neither can be
+    present.
+    """
     try:
         payload = json.loads(config_bytes.decode("utf-8"))
     except Exception:
@@ -543,17 +549,18 @@ def with_openai_api_key(config_bytes: bytes) -> bytes:
     if not isinstance(payload, dict):
         return config_bytes
 
-    models = payload.get("models")
-    if not isinstance(models, dict):
-        return config_bytes
-    providers = models.get("providers")
+    providers = payload.get("models", {}).get("providers")
     if not isinstance(providers, dict):
         return config_bytes
-    openai = providers.get("openai")
-    if not isinstance(openai, dict):
-        return config_bytes
 
-    openai["apiKey"] = api_key
+    openai_key = os.getenv(OPENAI_API_KEY_ENV)
+    if openai_key and isinstance(providers.get("openai"), dict):
+        providers["openai"]["apiKey"] = openai_key
+
+    anthropic_key = os.getenv("ANTHROPIC_API_KEY")
+    if anthropic_key and isinstance(providers.get("anthropic"), dict):
+        providers["anthropic"]["apiKey"] = anthropic_key
+
     return json.dumps(payload, indent=2).encode("utf-8")
 
 
