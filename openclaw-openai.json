@@ -7,14 +7,20 @@
 },
   "models": {
     "providers": {
+      "anthropic": {
+        "apiKey": "REPLACE_WITH_ENV_ANTHROPIC_API_KEY",
+        "baseUrl": "https://api.anthropic.com",
+        "models": [
+          { "id": "claude-sonnet-4-5", "name": "claude-sonnet-4-5" },
+          { "id": "claude-opus-4-5", "name": "claude-opus-4-5" }
+        ]
+      },
       "openai": {
         "apiKey": "REPLACE_WITH_ENV_OPENAI_API_KEY",
         "baseUrl": "https://api.openai.com/v1",
         "models": [
-          {
-            "id": "gpt-4o-mini",
-            "name": "gpt-4o-mini"
-          }
+          { "id": "gpt-4o-mini", "name": "gpt-4o-mini" },
+          { "id": "gpt-4o", "name": "gpt-4o" }
         ]
       }
     }
@@ -22,7 +28,7 @@
   "agents": {
     "defaults": {
       "model": {
-        "primary": "openai/gpt-4o-mini"
+        "primary": "anthropic/claude-sonnet-4-5"
       }
     }
   }

@@ -20,7 +20,7 @@ import urllib.parse
 import docker
 from docker.errors import APIError, DockerException, NotFound
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field, ConfigDict, field_validator
 import yaml
@@ -167,6 +167,20 @@ class WriteFileResponse(BaseModel):
     status: str
     path: str
     user: str
+
+
+class DeviceIdentityResponse(BaseModel):
+    """Device identity files read from inside a running openclaw container.
+
+    `identity` is a flat, best-effort projection of common field names that
+    Maestro-style clients look for (deviceId, operatorToken, publicKey,
+    privateKey). `raw` preserves the original file contents so clients can
+    adapt if openclaw's on-disk schema changes.
+    """
+    user: str
+    identity: dict[str, Any]
+    raw: dict[str, Any]
+    model_config = ConfigDict(extra="allow")
 
 
 class ChatMessage(BaseModel):
@@ -518,10 +532,16 @@ def put_file_into_container(container: docker.models.containers.Container, dest_
         raise ServiceError(500, "container_copy_failed", f"Could not copy '{name}' into container at '{dest_dir}'.")
 
 
-def with_openai_api_key(config_bytes: bytes) -> bytes:
-    api_key = os.getenv(OPENAI_API_KEY_ENV)
-    if not api_key:
-        return config_bytes
+def inject_provider_api_keys(config_bytes: bytes) -> bytes:
+    """Inject OPENAI_API_KEY and ANTHROPIC_API_KEY env values into the
+    matching provider entries in the openclaw config JSON.
+
+    Despite the historical function name, this also handles Anthropic:
+    if ANTHROPIC_API_KEY is set and the config has a `models.providers.
+    anthropic` entry, its `apiKey` is populated from the env value.
+    Each substitution is independent — either, both, or neither can be
+    present.
+    """
     try:
         payload = json.loads(config_bytes.decode("utf-8"))
     except Exception:
@@ -529,17 +549,18 @@ def with_openai_api_key(config_bytes: bytes) -> bytes:
     if not isinstance(payload, dict):
         return config_bytes
 
-    models = payload.get("models")
-    if not isinstance(models, dict):
-        return config_bytes
-    providers = models.get("providers")
+    providers = payload.get("models", {}).get("providers")
     if not isinstance(providers, dict):
         return config_bytes
-    openai = providers.get("openai")
-    if not isinstance(openai, dict):
-        return config_bytes
 
-    openai["apiKey"] = api_key
+    openai_key = os.getenv(OPENAI_API_KEY_ENV)
+    if openai_key and isinstance(providers.get("openai"), dict):
+        providers["openai"]["apiKey"] = openai_key
+
+    anthropic_key = os.getenv("ANTHROPIC_API_KEY")
+    if anthropic_key and isinstance(providers.get("anthropic"), dict):
+        providers["anthropic"]["apiKey"] = anthropic_key
+
     return json.dumps(payload, indent=2).encode("utf-8")
 
 
@@ -614,9 +635,24 @@ def seed_openclaw_state(
     try:
         seed.start()
         if config_file_path:
-            config_content = with_openai_api_key(config_file_path.read_bytes())
+            config_content = inject_provider_api_keys(config_file_path.read_bytes())
             put_file_into_container(seed, "/home/node/.openclaw", "openclaw.json", config_content)
         if skills_dir_path:
+            # Docker's first-mount content-preservation copies the openclaw
+            # image's built-in /app/skills/ (~50 general-purpose skills —
+            # 1password, apple-notes, slack, taskflow, weather, etc.) into
+            # the freshly-created named volume before the bind takes effect.
+            # Those skills bloat the system prompt to 34k+ tokens and blow
+            # past OpenAI's per-model TPM limits. Wipe them so only our
+            # seed (just maestro-comfysql) ends up in the mounted volume.
+            wipe = seed.exec_run(["sh", "-lc", "rm -rf /app/skills/* /app/skills/.??*"], user="0:0")
+            if wipe.exit_code != 0:
+                print(
+                    f"[openclaw-k] warning: failed to wipe /app/skills before seed in "
+                    f"{user.container_name} (exit={wipe.exit_code}): "
+                    f"{(wipe.output or b'').decode('utf-8', errors='replace')[:200]}",
+                    flush=True,
+                )
             put_directory_into_container(seed, skills_dir_path, "/app/skills")
         if workspace_dir_path:
             put_directory_into_container(seed, workspace_dir_path, "/home/node/.openclaw/workspace")
@@ -694,13 +730,129 @@ def read_user_info(client: docker.DockerClient, username: str) -> tuple[docker.m
     return container, user
 
 
-def safe_set_config(container: docker.models.containers.Container, path: str, value: str) -> None:
+def safe_set_config(
+    container: docker.models.containers.Container,
+    path: str,
+    value: str,
+    *,
+    optional: bool = False,
+) -> None:
     result = container.exec_run(
         ["node", "dist/index.js", "config", "set", path, value, "--strict-json"],
         demux=False,
     )
     if result.exit_code != 0:
+        if optional:
+            # Some config keys are version-dependent; if the container's openclaw
+            # build no longer accepts this key, log and continue rather than
+            # failing provisioning. The container is healthy; this is cosmetic.
+            detail = (result.output or b"").decode("utf-8", errors="replace").strip()
+            print(
+                f"[openclaw-k] warning: optional config '{path}' not set "
+                f"(exit={result.exit_code}): {detail[:200]}",
+                flush=True,
+            )
+            return
         raise ServiceError(500, "config_set_failed", f"Failed to set config '{path}'.")
+
+
+def get_device_identity_service(username: str) -> dict[str, Any]:
+    """Read a container's device identity + pairing files from its config volume.
+
+    Openclaw writes device identity JSON (deviceId, keypair) and pairing info
+    (operatorToken) under /home/node/.openclaw shortly after first boot. Paths
+    and field names vary between openclaw versions, so we:
+
+      1. Probe a handful of likely paths via `docker exec cat`.
+      2. Additionally scan /home/node/.openclaw/identity and .../devices for
+         any *.json files we didn't hardcode.
+      3. Flatten common field names (deviceId/operatorToken/publicKey/
+         privateKey, plus snake_case variants) into `identity`.
+      4. Return the full raw contents so Maestro-side code can adapt if
+         names drift.
+
+    Returns 404 if the container is missing; 409 if no identity files were
+    found (container may still be initializing).
+    """
+    user = UserContainer(username)
+    client = get_docker_client()
+    try:
+        container = client.containers.get(user.container_name)
+    except NotFound as exc:
+        raise ServiceError(404, "user_not_found", f"User '{username}' not found.") from exc
+
+    candidate_paths = [
+        "/home/node/.openclaw/identity/device.json",
+        "/home/node/.openclaw/devices/paired.json",
+        "/home/node/.openclaw/device.json",
+        "/home/node/.openclaw/identity.json",
+    ]
+
+    collected: dict[str, Any] = {}
+
+    def _try_read(path: str) -> None:
+        if path in collected:
+            return
+        result = container.exec_run(["cat", path], demux=False)
+        if result.exit_code != 0:
+            return
+        try:
+            raw = (result.output or b"").decode("utf-8")
+            parsed = json.loads(raw)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return
+        collected[path] = parsed
+
+    for path in candidate_paths:
+        _try_read(path)
+
+    discover = container.exec_run(
+        [
+            "sh", "-c",
+            "find /home/node/.openclaw/identity /home/node/.openclaw/devices "
+            "-maxdepth 3 -type f -name '*.json' 2>/dev/null || true",
+        ],
+        demux=False,
+    )
+    if discover.exit_code == 0:
+        extra_paths = (discover.output or b"").decode("utf-8", errors="replace").strip().splitlines()
+        for path in extra_paths:
+            path = path.strip()
+            if path:
+                _try_read(path)
+
+    if not collected:
+        raise ServiceError(
+            409,
+            "device_not_ready",
+            f"Device identity files not yet written for '{username}' — try again in a moment.",
+        )
+
+    flat: dict[str, Any] = {}
+    # Field-name variants observed in the wild: openclaw's identity/device.json
+    # uses camelCase with the `Pem` suffix for keys (`privateKeyPem`,
+    # `publicKeyPem`). Include those explicitly. `operatorToken` may not be
+    # present at all when the container is configured with
+    # `gateway.controlUi.dangerouslyDisableDeviceAuth=true` (simple auth mode,
+    # no pairing) — that's fine; the caller treats it as optional.
+    interesting_fields = (
+        "deviceId", "device_id",
+        "operatorToken", "operator_token",
+        "privateKey", "private_key",
+        "devicePrivateKey", "device_private_key",
+        "privateKeyPem", "private_key_pem",
+        "publicKey", "public_key",
+        "devicePublicKey", "device_public_key",
+        "publicKeyPem", "public_key_pem",
+    )
+    for doc in collected.values():
+        if not isinstance(doc, dict):
+            continue
+        for field in interesting_fields:
+            if field in doc and field not in flat:
+                flat[field] = doc[field]
+
+    return {"user": username, "identity": flat, "raw": collected}
 
 
 def extract_host_port(container: docker.models.containers.Container) -> int | None:
@@ -766,8 +918,27 @@ def create_user_service(
             user.workspace_volume: {"bind": "/home/node/.openclaw/workspace", "mode": "rw"},
             user.skills_volume: {"bind": "/app/skills", "mode": "rw"},
         }
+        # Bind-mount /opt/comfysql (read-only) if it exists on the host so
+        # pip install inside the container can read from a local path.
+        # steliosot/comfysql is private so containers can't clone it directly;
+        # the VM operator maintains /opt/comfysql via an authenticated clone.
+        if Path("/opt/comfysql").is_dir():
+            volume_mounts["/opt/comfysql"] = {"bind": "/opt/comfysql", "mode": "ro"}
         skills_dir_path, soul_file_path, workspace_dir_path = resolve_optional_defaults()
         seed_openclaw_state(client, image, volume_mounts, config_file_path, skills_dir_path, soul_file_path, workspace_dir_path)
+
+        # Maestro-side callback wiring: the agent runs `maestro-state ...`
+        # inside the container, which POSTs to Maestro's API to push
+        # Production Desk / sidebar / image updates. We pass the
+        # Maestro API base URL + the container's gateway token (same
+        # one Maestro stores in openclaw_instances.auth_token_hash);
+        # Maestro maps token → user on the callback side.
+        maestro_api_base = os.environ.get("MAESTRO_API_URL", "")
+        container_env = {
+            "OPENCLAW_GATEWAY_TOKEN": token,
+            "MAESTRO_CALLBACK_URL": f"{maestro_api_base.rstrip('/')}/api/agent-callback/state" if maestro_api_base else "",
+            "MAESTRO_CALLBACK_TOKEN": token,
+        }
 
         container = client.containers.run(
             image,
@@ -775,7 +946,7 @@ def create_user_service(
             detach=True,
             restart_policy={"Name": "unless-stopped"},
             ports={f"{OPENCLAW_INTERNAL_PORT}/tcp": (publish_bind_ip, port)},
-            environment={"OPENCLAW_GATEWAY_TOKEN": token},
+            environment=container_env,
             command=["node", "openclaw.mjs", "gateway", "--allow-unconfigured", "--bind", "lan"],
             labels={"app": "openclaw", "managed-by": "openclaw-k", "openclaw-k.user": username},
             volumes=volume_mounts,
@@ -783,7 +954,196 @@ def create_user_service(
 
         safe_set_config(container, "gateway.controlUi.allowedOrigins", f'["http://127.0.0.1:{port}","http://localhost:{port}"]')
         safe_set_config(container, "gateway.controlUi.dangerouslyAllowHostHeaderOriginFallback", "true")
-        safe_set_config(container, "gateway.controlUi.dangerouslyDisableDeviceAuth", "true")
+        # Optional: newer openclaw builds no longer accept this key (MAE-6).
+        # Treat as best-effort — the container still boots and is healthy
+        # regardless, and device auth is desirable anyway for the WebSocket flow.
+        safe_set_config(container, "gateway.controlUi.dangerouslyDisableDeviceAuth", "true", optional=True)
+
+        # Install Maestro-required tooling in the container. The openclaw
+        # image ships python3 and git but no pip, no sudo, and no comfysql
+        # (the client our maestro-comfysql skill needs to talk to ComfyUI).
+        # Do it once here so new users don't have to wait / install manually.
+        #
+        # Two separate exec_run calls because `sudo` isn't available in the
+        # container — we can't drop from root to node inside a single shell.
+        apt_result = container.exec_run(
+            [
+                "sh", "-lc",
+                "apt-get update -qq && apt-get install -y -qq python3-pip",
+            ],
+            user="0:0",
+        )
+        if apt_result.exit_code != 0:
+            print(
+                f"[openclaw-k] warning: apt-get python3-pip failed in "
+                f"{user.container_name} (exit={apt_result.exit_code}): "
+                f"{(apt_result.output or b'').decode('utf-8', errors='replace')[:400]}",
+                flush=True,
+            )
+        elif not Path("/opt/comfysql").is_dir():
+            print(
+                f"[openclaw-k] warning: /opt/comfysql not found on VM — "
+                f"maestro-comfysql skill will not be usable in "
+                f"{user.container_name} until an authenticated clone is staged",
+                flush=True,
+            )
+        else:
+            # comfysql is bind-mounted at /opt/comfysql (read-only) via
+            # volume_mounts above. pip needs to write `src/comfysql.egg-info`
+            # to the source directory during the wheel build, so we can't
+            # install directly from the read-only mount. Copy to /tmp
+            # (~400 KB without examples/output) and install from there.
+            pip_result = container.exec_run(
+                [
+                    "sh", "-lc",
+                    # Copy bind-mount to writable /tmp, exclude the heavy
+                    # `examples/` + `output/` dirs pip doesn't need.
+                    "cp -r /opt/comfysql /tmp/comfysql-src && "
+                    "rm -rf /tmp/comfysql-src/examples /tmp/comfysql-src/output && "
+                    # --break-system-packages overrides PEP 668
+                    # externally-managed marker on Debian's python.
+                    "python3 -m pip install --user --break-system-packages --quiet "
+                    "/tmp/comfysql-src && "
+                    "rm -rf /tmp/comfysql-src && "
+                    "echo 'export PATH=$HOME/.local/bin:$PATH' >> /home/node/.bashrc && "
+                    # Set up a writable comfysql workdir at /home/node/comfysql:
+                    #   - comfy-agent.json copied from the read-only mount
+                    #   - input/ symlinked so it picks up workflow templates
+                    #   - .state/ populated with the workflow registry
+                    #     (copied from the mount so sql_schema_cache.json
+                    #     writes land in the writable copy, not the RO mount)
+                    # The agent runs comfysql with this as CWD (see SKILL.md).
+                    "mkdir -p /home/node/comfysql/output && "
+                    "cp /opt/comfysql/comfy-agent.json /home/node/comfysql/comfy-agent.json && "
+                    "ln -sf /opt/comfysql/input /home/node/comfysql/input && "
+                    "if [ -d /opt/comfysql/.state ]; then "
+                    "  cp -r /opt/comfysql/.state /home/node/comfysql/.state; "
+                    "else "
+                    "  mkdir -p /home/node/comfysql/.state; "
+                    "fi && "
+                    # Disable the container image's built-in imagegen system
+                    # skill. It tells the agent to use Codex's `image_gen`
+                    # built-in tool (which requires an ACP agent that isn't
+                    # set up for our OpenAI config). Without disabling it,
+                    # the agent picks `imagegen` over our `maestro-comfysql`
+                    # skill for every image task and then dead-ends.
+                    "rm -rf /home/node/.codex/skills/.system/imagegen && "
+                    # Also nuke HEARTBEAT.md — openclaw recreates it on each
+                    # boot with a docstring telling the agent to reply
+                    # HEARTBEAT_OK periodically, which eats TPM budget fast.
+                    # The file's own docstring claims "keep empty to skip",
+                    # but the plugin still fires as long as it exists.
+                    "rm -f /home/node/.openclaw/workspace/HEARTBEAT.md",
+                ],
+                user="1000:1000",
+                workdir="/home/node",
+                environment={"HOME": "/home/node"},
+            )
+            # Separately, as root, symlink the pip-installed comfysql/
+            # comfy-agent binaries into /usr/local/bin/ so they're on the
+            # default PATH. The agent's tool-calling shell is non-login
+            # and doesn't source .bashrc, so /home/node/.local/bin is not
+            # on PATH. Without the symlinks, agent reports "comfysql
+            # command not found" and hallucinates fake SQL instead.
+            container.exec_run(
+                [
+                    "sh", "-lc",
+                    "ln -sf /home/node/.local/bin/comfysql /usr/local/bin/comfysql && "
+                    "ln -sf /home/node/.local/bin/comfy-agent /usr/local/bin/comfy-agent"
+                ],
+                user="0:0",
+            )
+
+            # Install the Maestro-state bash helper so the agent can push
+            # Production Desk / image updates back to Maestro without
+            # needing to run raw curl. Usage examples:
+            #   maestro-state --project $PROJECT_ID --title "Giza shot"
+            #   maestro-state --project $PROJECT_ID --stage image \\
+            #                 --image-path generated/giza_01.png
+            #   maestro-state --project $PROJECT_ID --message "image ready"
+            #
+            # Reads MAESTRO_CALLBACK_URL and MAESTRO_CALLBACK_TOKEN from
+            # env (set by the container.run call above). Writes nothing
+            # if either is missing so local/dev containers don't break.
+            maestro_state_script = r'''#!/bin/bash
+# Push a Production Desk / artifact update from the agent back to
+# Maestro. Meant to be called inline from the agent's bash tool.
+set -e
+URL="${MAESTRO_CALLBACK_URL:-}"
+TOKEN="${MAESTRO_CALLBACK_TOKEN:-}"
+if [ -z "$URL" ] || [ -z "$TOKEN" ]; then
+  echo "[maestro-state] callback env not configured; skipping" >&2
+  exit 0
+fi
+
+PROJECT=""
+TITLE=""
+STAGE=""
+STAGE_UPDATE=""
+STAGE_COMPLETE=""
+IMAGE_PATH=""
+MESSAGE=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --project) PROJECT="$2"; shift 2;;
+    --title) TITLE="$2"; shift 2;;
+    --stage) STAGE="$2"; shift 2;;
+    --stage-update) STAGE_UPDATE="$2"; shift 2;;
+    --stage-complete) STAGE_COMPLETE="true"; shift;;
+    --image-path) IMAGE_PATH="$2"; shift 2;;
+    --message) MESSAGE="$2"; shift 2;;
+    *) echo "[maestro-state] unknown flag: $1" >&2; exit 2;;
+  esac
+done
+
+if [ -z "$PROJECT" ]; then
+  echo "[maestro-state] --project is required" >&2
+  exit 2
+fi
+
+# Build JSON with python for safe escaping. Fields omitted when empty.
+BODY=$(python3 -c '
+import json, sys
+fields = {
+  "projectId": sys.argv[1],
+  "title":     sys.argv[2] or None,
+  "stage":     sys.argv[3] or None,
+  "stageUpdate": (json.loads(sys.argv[4]) if sys.argv[4] else None),
+  "stageComplete": (True if sys.argv[5] == "true" else None),
+  "imagePath": sys.argv[6] or None,
+  "message":   sys.argv[7] or None,
+}
+print(json.dumps({k: v for k, v in fields.items() if v is not None}))
+' "$PROJECT" "$TITLE" "$STAGE" "$STAGE_UPDATE" "$STAGE_COMPLETE" "$IMAGE_PATH" "$MESSAGE")
+
+curl -sS -X POST \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "$BODY" \
+  "$URL" >/dev/null 2>&1 || {
+    echo "[maestro-state] callback failed" >&2
+    exit 1
+  }
+echo "[maestro-state] pushed: $BODY"
+'''
+            # Write the script and mark executable.
+            put_file_into_container(
+                container, "/usr/local/bin", "maestro-state", maestro_state_script.encode("utf-8")
+            )
+            container.exec_run(
+                ["sh", "-lc", "chmod +x /usr/local/bin/maestro-state"],
+                user="0:0",
+            )
+
+            if pip_result.exit_code != 0:
+                print(
+                    f"[openclaw-k] warning: pip install comfysql failed in "
+                    f"{user.container_name} (exit={pip_result.exit_code}): "
+                    f"{(pip_result.output or b'').decode('utf-8', errors='replace')[:400]}",
+                    flush=True,
+                )
+
         container.restart()
         wait_until_ready(container, timeout_seconds=wait_timeout_seconds)
         container.reload()
@@ -950,7 +1310,7 @@ def update_all_service(
         }
         try:
             if config_file_path:
-                config_content = with_openai_api_key(config_file_path.read_bytes())
+                config_content = inject_provider_api_keys(config_file_path.read_bytes())
                 put_file_into_container(container, "/home/node/.openclaw", "openclaw.json", config_content)
                 item["applied"]["config"] = True
 
@@ -1336,6 +1696,69 @@ def create_api_app(admin_token: str) -> FastAPI:
                 return resp.json()
             except Exception as exc:
                 raise ServiceError(502, "openclaw_error", f"OpenClaw request failed: {exc}")
+
+    @app.get("/v1/users/{username}/device", response_model=DeviceIdentityResponse, dependencies=[Depends(require_bearer)])
+    def get_device_identity_endpoint(username: str) -> dict[str, Any]:
+        """Return the device identity and pairing info for a running container.
+
+        Intended to be called by Maestro immediately after successful provisioning
+        so it can populate its `openclaw_instances` table (deviceId, operatorToken,
+        device keypair) and unlock WebSocket-based chat without a manual SSH step.
+
+        Returns 404 if the container does not exist, 409 if identity files have
+        not yet been written (container still initializing — caller should retry).
+        The response body contains secrets; do not log it.
+        """
+        return get_device_identity_service(username=username)
+
+    @app.get("/v1/users/{username}/files/{path:path}", dependencies=[Depends(require_bearer)])
+    def read_file_endpoint(username: str, path: str) -> StreamingResponse:
+        """Stream the contents of a workspace file back to the caller.
+
+        Used by Maestro to pull generated images / artifacts out of a
+        container and display them inline in the web UI. Path is
+        evaluated relative to the container's workspace root
+        (/home/node/.openclaw/workspace) and traversal outside that
+        root is rejected.
+        """
+        import mimetypes
+        import posixpath
+
+        user = UserContainer(username)
+        try:
+            container = docker.from_env().containers.get(user.container_name)
+        except NotFound:
+            raise ServiceError(404, "user_not_found", f"User '{username}' not found.")
+
+        workspace_base = "/home/node/.openclaw/workspace"
+        # Collapse any ../ traversal attempts.
+        normalized = posixpath.normpath("/" + path).lstrip("/")
+        if normalized.startswith("..") or normalized == "":
+            raise ServiceError(400, "invalid_path", "Path must be relative and inside the workspace.")
+        src_path = posixpath.join(workspace_base, normalized)
+
+        # Check existence + get size via stat; `test -e` short-circuits on missing files.
+        check = container.exec_run(["test", "-f", src_path])
+        if check.exit_code != 0:
+            raise ServiceError(404, "file_not_found", f"File not found: {normalized}")
+
+        # Stream the file bytes out via `cat`. For small files this is
+        # fine; large images (>50 MB) might want a multi-chunk path but
+        # Qwen Image Edit outputs are typically ~1-4 MB.
+        result = container.exec_run(["cat", src_path], demux=False)
+        if result.exit_code != 0:
+            raise ServiceError(500, "read_failed", f"Failed to read {normalized}")
+
+        mime, _ = mimetypes.guess_type(normalized)
+        headers = {"Cache-Control": "private, max-age=300"}
+        filename = posixpath.basename(normalized)
+        headers["Content-Disposition"] = f'inline; filename="{filename}"'
+
+        return StreamingResponse(
+            iter([result.output or b""]),
+            media_type=mime or "application/octet-stream",
+            headers=headers,
+        )
 
     @app.put("/v1/users/{username}/files", response_model=WriteFileResponse, dependencies=[Depends(require_bearer)])
     def write_file_endpoint(username: str, request: WriteFileRequest) -> dict[str, Any]:
