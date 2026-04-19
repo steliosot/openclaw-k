@@ -1,7 +1,7 @@
 ---
 name: maestro-comfysql
 description: "Generate and edit images by writing small SQL queries against pre-built ComfyUI workflow templates. PRIMARY skill for Maestro's image pipeline. Use when the user wants to create, edit, composite, re-light, re-pose, or transform images — including putting a person in a new location, changing outfit, camera-angle changes for storyboard shots, expression adjustments, virtual try-on, color-matching between images. Do NOT use for text-only responses, video rendering (not wired up), or tasks that don't involve producing an image."
-homepage: https://github.com/steliosot/comfysql/tree/maestro-fixes
+homepage: https://github.com/steliosot/comfysql
 metadata:
   {
     "openclaw":
@@ -23,7 +23,7 @@ You do **not** write ComfyUI workflow JSON. You do **not** run Python scripts. Y
 ## How it actually works
 
 1. Maestro ships a handful of workflow templates at `/home/node/comfysql/input/workflows/` (symlinked to read-only `/opt/comfysql/input/workflows/`) — each is a JSON file that encodes a specific ComfyUI pipeline (image-to-image with N references, character render, camera change, virtual try-on, etc).
-2. You write a SQL statement like `SELECT image FROM qwen_1ref WHERE \`5.prompt\`='…' AND \`4.image\`='subject.png'`.
+2. You write a SQL statement like `SELECT image FROM qwen_1ref WHERE 5.prompt='…' AND 4.image='subject.png'`.
 3. `comfysql` takes that SQL, finds the matching template, substitutes your WHERE clause values into the right nodes of the template, and POSTs the resulting workflow JSON to the Maestro ComfyUI server.
 4. The server runs the workflow on GPU and returns an image.
 
@@ -55,7 +55,6 @@ The qwen image-edit family is split by **how many reference images you have**. C
 | `qwen_next_scene` | Take an existing shot, produce the same moment from a different camera (pull to full body, swing to side angle, reverse shot) | Video storyboarding. Given shot N, produce shot N+1 with a different framing but consistent subject. |
 | `expression_editor` | Change *only* the emotion on a face while preserving identity | Smile, frown, raised brows, closed eyes. Operates on a single face image; does not reframe. |
 | `color_match` | Color-grade one image to match the palette of a reference | Harmonizing composited elements, shot-to-shot continuity. |
-| `fashn_vton` | Virtual try-on — put a garment on a person | "How would this shirt look on the model?" Garment can be flat-lay or on another model. |
 | `txt2img_empty_latent` | Pure text-to-image, no reference | Concept art, abstract moodboards, anything where no input image is provided. |
 
 **Pick rule of thumb:**
@@ -65,8 +64,9 @@ The qwen image-edit family is split by **how many reference images you have**. C
 - Tight on a face, premium quality → `qwen_character_scene`
 - Different camera on an existing shot → `qwen_next_scene`
 - Change only the facial expression → `expression_editor`
-- Try-on a garment → `fashn_vton`
 - No inputs, just text → `txt2img_empty_latent`
+
+For virtual try-on (put a garment on a person), prefer `qwen_2ref` with a clear prompt describing image1 as the model and image2 as the garment — the dedicated try-on workflow isn't reliable right now and is deliberately not exposed as a skill target.
 
 The qwen_Nref workflows share the same model stack (Qwen-Image-Edit GGUF + Lightning-4step + Boreal LoRAs). They differ only in how many `LoadImage` nodes they expose and how many `imageN` inputs the prompt encoder takes. This keeps each workflow's graph minimal — no wasted LoadImage nodes for unused references.
 
@@ -95,12 +95,12 @@ cd /home/node/comfysql && comfysql sql maestro --sql "DESCRIBE WORKFLOW qwen_1re
 
 # Dry-run: compile SQL to workflow JSON without submitting. Useful to catch
 # missing fields before burning GPU time.
-cd /home/node/comfysql && comfysql sql maestro --dry-run --sql "SELECT image FROM qwen_1ref WHERE \`5.prompt\`='…' AND \`4.image\`='person.png';"
+cd /home/node/comfysql && comfysql sql maestro --dry-run --sql "SELECT image FROM qwen_1ref WHERE 5.prompt='…' AND 4.image='person.png';"
 
 # Real run, downloads the output to a writable dir
 cd /home/node/comfysql && comfysql sql maestro -y \
   --download-output --download-dir /home/node/.openclaw/workspace/generated/ \
-  --sql "SELECT image FROM qwen_1ref WHERE \`5.prompt\`='…' AND \`4.image\`='person.png';"
+  --sql "SELECT image FROM qwen_1ref WHERE 5.prompt='…' AND 4.image='person.png';"
 ```
 
 ## The qwen_Nref family — slot layout
@@ -125,8 +125,8 @@ cd /home/node/comfysql && comfysql sql maestro -y \
   --timeout 600 \
   --download-output --download-dir /home/node/.openclaw/workspace/generated/ \
   --sql "SELECT image FROM qwen_1ref
-         WHERE \`4.image\`='subject.jpg'
-           AND \`5.prompt\`='In front of the Eiffel Tower, Paris, overcast afternoon, 35mm, natural light, realistic skin. Keep the person from image1.';"
+         WHERE 4.image='subject.jpg'
+           AND 5.prompt='In front of the Eiffel Tower, Paris, overcast afternoon, 35mm, natural light, realistic skin. Keep the person from image1.';"
 ```
 
 ### End-to-end: two-reference edit (`qwen_2ref`)
@@ -139,9 +139,9 @@ cd /home/node/comfysql && comfysql sql maestro -y \
   --timeout 600 \
   --download-output --download-dir /home/node/.openclaw/workspace/generated/ \
   --sql "SELECT image FROM qwen_2ref
-         WHERE \`4.image\`='person.png'
-           AND \`30.image\`='outfit.jpg'
-           AND \`5.prompt\`='Keep the character from image1. She is wearing the outfit from image2. Walking a wide Paris boulevard at golden hour, cinematic.';"
+         WHERE 4.image='person.png'
+           AND 30.image='outfit.jpg'
+           AND 5.prompt='Keep the character from image1. She is wearing the outfit from image2. Walking a wide Paris boulevard at golden hour, cinematic.';"
 ```
 
 ### End-to-end: three-reference composite (`qwen_3ref`)
@@ -155,36 +155,13 @@ cd /home/node/comfysql && comfysql sql maestro -y \
   --timeout 600 \
   --download-output --download-dir /home/node/.openclaw/workspace/generated/ \
   --sql "SELECT image FROM qwen_3ref
-         WHERE \`4.image\`='person.png'
-           AND \`30.image\`='outfit.jpg'
-           AND \`31.image\`='bag.jpg'
-           AND \`5.prompt\`='Keep the character from image1. She is wearing the outfit from image2 and carrying the bag from image3. Walking a wide Paris boulevard at golden hour, cinematic.';"
+         WHERE 4.image='person.png'
+           AND 30.image='outfit.jpg'
+           AND 31.image='bag.jpg'
+           AND 5.prompt='Keep the character from image1. She is wearing the outfit from image2 and carrying the bag from image3. Walking a wide Paris boulevard at golden hour, cinematic.';"
 ```
 
 If any image isn't on the ComfyUI server, the run errors with an "invalid value" for that field listing the allowed filenames. Use `comfysql copy-assets maestro` to stage it.
-
-## End-to-end: virtual try-on with `fashn_vton`
-
-Given a person photo and a garment photo (either a flat-lay or a model wearing it):
-
-```bash
-# Stage both images into ComfyUI
-cd /home/node/comfysql && comfysql copy-assets maestro /tmp/person.png
-cd /home/node/comfysql && comfysql copy-assets maestro /tmp/garment.jpg
-
-# Run try-on. `category` is one of tops / bottoms / one-pieces.
-# `garment_photo_type` is flat-lay (product shot on white) or model (on another person).
-cd /home/node/comfysql && comfysql sql maestro -y \
-  --timeout 600 \
-  --download-output --download-dir /home/node/.openclaw/workspace/generated/ \
-  --sql "SELECT image FROM fashn_vton
-         WHERE \`1.image\`='person.png'
-           AND \`2.image\`='garment.jpg'
-           AND category='tops'
-           AND garment_photo_type='flat-lay';"
-```
-
-Model weights (`fashn-ai/fashn-vton-1.5`, `fashn-ai/DWPose`) download from Hugging Face on the first run — that first invocation will take several extra minutes, subsequent ones are cached.
 
 ## When NOT to use this skill
 
