@@ -22,8 +22,8 @@ You do **not** write ComfyUI workflow JSON. You do **not** run Python scripts. Y
 
 ## How it actually works
 
-1. Maestro ships ~7 workflow templates at `/home/node/comfysql/input/workflows/` (symlinked to read-only `/opt/comfysql/input/workflows/`) — each is a JSON file that encodes a specific ComfyUI pipeline (image-to-image, character render, camera change, etc).
-2. You write a SQL statement like `SELECT image FROM qwen_image_edit WHERE prompt='…' AND input_image='…'`.
+1. Maestro ships a handful of workflow templates at `/home/node/comfysql/input/workflows/` (symlinked to read-only `/opt/comfysql/input/workflows/`) — each is a JSON file that encodes a specific ComfyUI pipeline (image-to-image with N references, character render, camera change, virtual try-on, etc).
+2. You write a SQL statement like `SELECT image FROM qwen_1ref WHERE \`5.prompt\`='…' AND \`4.image\`='subject.png'`.
 3. `comfysql` takes that SQL, finds the matching template, substitutes your WHERE clause values into the right nodes of the template, and POSTs the resulting workflow JSON to the Maestro ComfyUI server.
 4. The server runs the workflow on GPU and returns an image.
 
@@ -42,12 +42,16 @@ Outputs should go to a writable dir (the bind-mount is read-only), so pass `--do
 
 **Server alias** is always `maestro` (points at the Maestro ComfyUI tunnel).
 
-## The seven workflow templates
+## The workflow templates
+
+The qwen image-edit family is split by **how many reference images you have**. Count the user's inputs, pick the workflow with that number, done. No semantic routing — no "outfit vs product vs location" guesswork. The prompt text is where semantics live.
 
 | Template | What it does | Use when |
 |---|---|---|
-| `qwen_image_edit` | General image-to-image edit driven by a text instruction + one or more reference images | Default for editing an image. "Put this dress on her", "have him hold this object", "place her in this location", "add sunglasses". |
-| `qwen_character_scene` | Higher-fidelity character render (premium face/skin/lighting). Slower than qwen_image_edit. | Close-ups and hero shots where the face is the subject. Key art. |
+| `qwen_1ref` | Qwen image edit with **one** reference image. | User gave you a single reference. "Put this person in Paris", "add sunglasses to her", "re-light this shot". |
+| `qwen_2ref` | Qwen image edit with **two** reference images. | User gave you two references. The prompt describes their roles ("wearing the outfit from image2", "in the location from image2"). |
+| `qwen_3ref` | Qwen image edit with **three** reference images. | User gave you three references. Prompt describes each in words. |
+| `qwen_character_scene` | Higher-fidelity character render (premium face/skin/lighting). Slower than the qwen_Nref family. | Close-ups and hero shots where the face is the subject. Key art. |
 | `qwen_next_scene` | Take an existing shot, produce the same moment from a different camera (pull to full body, swing to side angle, reverse shot) | Video storyboarding. Given shot N, produce shot N+1 with a different framing but consistent subject. |
 | `expression_editor` | Change *only* the emotion on a face while preserving identity | Smile, frown, raised brows, closed eyes. Operates on a single face image; does not reframe. |
 | `color_match` | Color-grade one image to match the palette of a reference | Harmonizing composited elements, shot-to-shot continuity. |
@@ -55,12 +59,16 @@ Outputs should go to a writable dir (the bind-mount is read-only), so pass `--do
 | `txt2img_empty_latent` | Pure text-to-image, no reference | Concept art, abstract moodboards, anything where no input image is provided. |
 
 **Pick rule of thumb:**
-- User provides an image of a subject + asks for something done to them → `qwen_image_edit`
-- Focus is tight on a face → `qwen_character_scene`
-- User wants a different camera on an existing shot → `qwen_next_scene`
-- User wants to change emotion/expression only → `expression_editor`
-- Pure try-on → `fashn_vton`
-- Just text, no inputs → `txt2img_empty_latent`
+- User gave **1** image + wants an edit → `qwen_1ref`
+- User gave **2** images (any pairing: subject+outfit, subject+location, two characters, …) → `qwen_2ref`
+- User gave **3** images → `qwen_3ref`
+- Tight on a face, premium quality → `qwen_character_scene`
+- Different camera on an existing shot → `qwen_next_scene`
+- Change only the facial expression → `expression_editor`
+- Try-on a garment → `fashn_vton`
+- No inputs, just text → `txt2img_empty_latent`
+
+The qwen_Nref workflows share the same model stack (Qwen-Image-Edit GGUF + Lightning-4step + Boreal LoRAs). They differ only in how many `LoadImage` nodes they expose and how many `imageN` inputs the prompt encoder takes. This keeps each workflow's graph minimal — no wasted LoadImage nodes for unused references.
 
 ## SQL shape
 
@@ -83,49 +91,60 @@ Quotes: single-quote strings. Double up single quotes inside a string (SQL-style
 cd /home/node/comfysql && comfysql doctor maestro
 
 # See what fields a workflow accepts (before you write your WHERE clause)
-cd /home/node/comfysql && comfysql sql maestro --sql "DESCRIBE WORKFLOW qwen_image_edit;"
+cd /home/node/comfysql && comfysql sql maestro --sql "DESCRIBE WORKFLOW qwen_1ref;"
 
 # Dry-run: compile SQL to workflow JSON without submitting. Useful to catch
 # missing fields before burning GPU time.
-cd /home/node/comfysql && comfysql sql maestro --dry-run --sql "SELECT image FROM qwen_image_edit WHERE prompt='…' AND input_image='person.png';"
+cd /home/node/comfysql && comfysql sql maestro --dry-run --sql "SELECT image FROM qwen_1ref WHERE \`5.prompt\`='…' AND \`4.image\`='person.png';"
 
 # Real run, downloads the output to a writable dir
 cd /home/node/comfysql && comfysql sql maestro -y \
   --download-output --download-dir /home/node/.openclaw/workspace/generated/ \
-  --sql "SELECT image FROM qwen_image_edit WHERE prompt='…' AND input_image='person.png';"
+  --sql "SELECT image FROM qwen_1ref WHERE \`5.prompt\`='…' AND \`4.image\`='person.png';"
 ```
 
-## qwen_image_edit is a THREE-IMAGE compositor
+## The qwen_Nref family — slot layout
 
-`qwen_image_edit` takes three image inputs:
+All three share the same field names; you just use more slots as reference count goes up.
 
-- `4.image` — main subject (character / person)
-- `30.image` — outfit / secondary reference
-- `31.image` — product / tertiary reference
+| Workflow | `4.image` | `30.image` | `31.image` | Prompt field |
+|---|---|---|---|---|
+| `qwen_1ref` | subject (image1) | — | — | `5.prompt` |
+| `qwen_2ref` | image1 | image2 | — | `5.prompt` |
+| `qwen_3ref` | image1 | image2 | image3 | `5.prompt` |
 
-The prompt (`5.prompt`) references them as "image1" (subject), "image2" (outfit), "image3" (product). The workflow is optimized for compositing a character into a new look/scene with outfit + product refs.
+Refer to the images in your prompt by their role in **the scene you're describing**, not by slot name. "Keep the woman from image1" / "wearing the outfit from image2" / "holding the bag from image3" etc. — the encoder wires `imageN` to the corresponding slot automatically.
 
-**If the user only gave you ONE image** ("put this man in front of the Eiffel Tower"), pass the same file into all three slots. The model tolerates duplicate refs gracefully.
-
-### End-to-end: "put this man in front of the Eiffel Tower" (single subject)
+### End-to-end: single-reference edit (`qwen_1ref`)
 
 ```bash
 # Stage the user's image
 cd /home/node/comfysql && comfysql copy-assets maestro /tmp/subject.jpg
 
-# Run — pass subject.jpg into all three image slots when you don't have
-# dedicated outfit / product references.
 cd /home/node/comfysql && comfysql sql maestro -y \
   --timeout 600 \
   --download-output --download-dir /home/node/.openclaw/workspace/generated/ \
-  --sql "SELECT image FROM qwen_image_edit
+  --sql "SELECT image FROM qwen_1ref
          WHERE \`4.image\`='subject.jpg'
-           AND \`30.image\`='subject.jpg'
-           AND \`31.image\`='subject.jpg'
            AND \`5.prompt\`='In front of the Eiffel Tower, Paris, overcast afternoon, 35mm, natural light, realistic skin. Keep the person from image1.';"
 ```
 
-### End-to-end: full 3-image composite
+### End-to-end: two-reference edit (`qwen_2ref`)
+
+```bash
+cd /home/node/comfysql && comfysql copy-assets maestro /tmp/person.png
+cd /home/node/comfysql && comfysql copy-assets maestro /tmp/outfit.jpg
+
+cd /home/node/comfysql && comfysql sql maestro -y \
+  --timeout 600 \
+  --download-output --download-dir /home/node/.openclaw/workspace/generated/ \
+  --sql "SELECT image FROM qwen_2ref
+         WHERE \`4.image\`='person.png'
+           AND \`30.image\`='outfit.jpg'
+           AND \`5.prompt\`='Keep the character from image1. She is wearing the outfit from image2. Walking a wide Paris boulevard at golden hour, cinematic.';"
+```
+
+### End-to-end: three-reference composite (`qwen_3ref`)
 
 ```bash
 cd /home/node/comfysql && comfysql copy-assets maestro /tmp/person.png
@@ -135,7 +154,7 @@ cd /home/node/comfysql && comfysql copy-assets maestro /tmp/bag.jpg
 cd /home/node/comfysql && comfysql sql maestro -y \
   --timeout 600 \
   --download-output --download-dir /home/node/.openclaw/workspace/generated/ \
-  --sql "SELECT image FROM qwen_image_edit
+  --sql "SELECT image FROM qwen_3ref
          WHERE \`4.image\`='person.png'
            AND \`30.image\`='outfit.jpg'
            AND \`31.image\`='bag.jpg'
